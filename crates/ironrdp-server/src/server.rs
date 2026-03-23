@@ -26,12 +26,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use {ironrdp_dvc as dvc, ironrdp_rdpsnd as rdpsnd};
 
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayUpdate, RdpServerDisplay};
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
+use crate::gfx::{GfxHandler, GfxState};
 use crate::handler::RdpServerInputHandler;
 use crate::{builder, capabilities, SoundServerFactory};
 
@@ -87,7 +88,13 @@ impl RdpServerSecurity {
         match self {
             RdpServerSecurity::None => nego::SecurityProtocol::empty(),
             RdpServerSecurity::Tls(_) => nego::SecurityProtocol::SSL,
-            RdpServerSecurity::Hybrid(_) => nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX,
+            // Advertise HYBRID + HYBRID_EX + SSL so the acceptor can negotiate
+            // down to TLS-only if the client doesn't support NLA
+            RdpServerSecurity::Hybrid(_) => {
+                nego::SecurityProtocol::HYBRID
+                    | nego::SecurityProtocol::HYBRID_EX
+                    | nego::SecurityProtocol::SSL
+            }
         }
     }
 }
@@ -221,6 +228,8 @@ pub struct RdpServer {
     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
+    gfx_state: Arc<std::sync::Mutex<GfxState>>,
+    gfx_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -275,7 +284,24 @@ impl RdpServer {
             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
             creds: None,
             local_addr: None,
+            gfx_state: Arc::new(std::sync::Mutex::new(GfxState::new(0, 0, false))),
+            gfx_enabled: true,
         }
+    }
+
+    /// Set the GFX state (call before run() to share state with display)
+    pub fn set_gfx_state(&mut self, state: Arc<std::sync::Mutex<GfxState>>) {
+        self.gfx_state = state;
+    }
+
+    /// Get a reference to the GFX state
+    pub fn gfx_state(&self) -> &Arc<std::sync::Mutex<GfxState>> {
+        &self.gfx_state
+    }
+
+    /// Enable or disable GFX H.264 channel
+    pub fn set_gfx_enabled(&mut self, enabled: bool) {
+        self.gfx_enabled = enabled;
     }
 
     pub fn builder() -> builder::RdpServerBuilder<builder::WantsAddr> {
@@ -302,16 +328,33 @@ impl RdpServer {
         }
 
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let dvc = dvc::DrdynvcServer::new()
+        let mut dvc = dvc::DrdynvcServer::new()
             .with_dynamic_channel(AInputHandler {
                 handler: Arc::clone(&self.handler),
             })
             .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+
+        // Only register GFX channel if GFX frame sending is enabled
+        if self.gfx_enabled {
+            let gfx_handler = GfxHandler::new(Arc::clone(&self.gfx_state));
+            dvc = dvc.with_dynamic_channel(gfx_handler);
+            debug!("GFX channel registered");
+        }
+
         acceptor.attach_static_channel(dvc);
     }
 
     pub async fn run_connection(&mut self, stream: TcpStream) -> Result<()> {
         let framed = TokioFramed::new(stream);
+
+        // Reset GFX state for new connection
+        {
+            let mut gs = self.gfx_state.lock().unwrap();
+            let w = gs.width;
+            let h = gs.height;
+            let avc444_enabled = gs.avc444_enabled;
+            *gs = GfxState::new(w, h, avc444_enabled);
+        }
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
@@ -405,8 +448,14 @@ impl RdpServer {
                     debug!(?peer, "Received connection");
                     drop(ev_receiver);
                     if let Err(error) = self.run_connection(stream).await {
-                        error!(?error, "Connection error");
+                        let err_str = format!("{error:#}");
+                        if err_str.contains("reset by peer") || err_str.contains("Broken pipe") {
+                            warn!("Client disconnected: {err_str}");
+                        } else {
+                            error!(?error, "Connection error");
+                        }
                     }
+                    info!("Ready for next connection");
                     self.static_channels = StaticChannelSet::new();
                 }
                 else => break,
@@ -462,12 +511,49 @@ impl RdpServer {
         io_channel_id: u16,
         buffer: &mut Vec<u8>,
         mut encoder: UpdateEncoder,
+        gfx_state: &Arc<std::sync::Mutex<GfxState>>,
+        drdynvc_channel_id: Option<StaticChannelId>,
     ) -> Result<(RunState, UpdateEncoder)> {
         if let DisplayUpdate::Resize(desktop_size) = update {
             debug!(?desktop_size, "Display resize");
             encoder.set_desktop_size(desktop_size);
             deactivate_all(io_channel_id, user_channel_id, writer).await?;
             return Ok((RunState::DeactivationReactivation { desktop_size }, encoder));
+        }
+
+        // Handle GFX frames through the DVC channel
+        if let DisplayUpdate::GfxFrame(ref gfx_frame) = update {
+            let mut state = gfx_state.lock().unwrap();
+            if state.is_ready() {
+                if let Some(drdynvc_id) = drdynvc_channel_id {
+                    let channel_id = state.channel_id.unwrap();
+                    // All frame PDUs combined into a single ZGFX-wrapped buffer
+                    let pdu_data = GfxHandler::create_frame_pdu(&mut state, gfx_frame);
+                    drop(state); // release lock before async
+
+                    // Send as a single DVC message (auto-fragmented by encode_dvc_messages)
+                    let dvc_messages: Vec<dvc::DvcMessage> = vec![Box::new(crate::gfx::RawGfxPdu(pdu_data))];
+                    let svc_messages = dvc::encode_dvc_messages(
+                        channel_id,
+                        dvc_messages,
+                        ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+                    ).context("Failed to encode DVC messages")?;
+
+                    let data = server_encode_svc_messages(
+                        svc_messages.into(),
+                        drdynvc_id,
+                        user_channel_id,
+                    )?;
+                    writer.write_all(&data).await
+                        .context("failed to write GFX frame")?;
+
+                    return Ok((RunState::Continue, encoder));
+                }
+            } else {
+                drop(state);
+                // GFX not ready yet, fall through to bitmap encoding
+                trace!("GFX not ready, falling back to bitmap path");
+            }
         }
 
         let mut encoder_iter = encoder.update(update);
@@ -588,6 +674,19 @@ impl RdpServer {
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let ev_receiver = Arc::clone(&self.ev_receiver);
+        let gfx_state = Arc::clone(&self.gfx_state);
+
+        // Update GFX state with current desktop size
+        {
+            let size = self.display.lock().await.size().await;
+            let mut gs = self.gfx_state.lock().unwrap();
+            gs.width = size.width;
+            gs.height = size.height;
+        }
+
+        // Get DRDYNVC channel ID for sending GFX frames
+        let drdynvc_channel_id = self.get_channel_id_by_type::<dvc::DrdynvcServer>();
+
         let s = Rc::new(Mutex::new(self));
 
         let this = Rc::clone(&s);
@@ -618,6 +717,8 @@ impl RdpServer {
                             io_channel_id,
                             &mut buffer,
                             encoder,
+                            &gfx_state,
+                            drdynvc_channel_id,
                         )
                         .await?
                         {
@@ -721,24 +822,21 @@ impl RdpServer {
                     }
                 }
                 CapabilitySet::Bitmap(b) => {
-                    if !b.desktop_resize_flag {
-                        debug!("Desktop resize is not supported by the client");
-                        continue;
-                    }
-
                     let client_size = DesktopSize {
                         width: b.desktop_width,
                         height: b.desktop_height,
                     };
                     let display_size = self.display.lock().await.size().await;
 
-                    // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
-                    // The client will likely drop the connection.
-                    if client_size.width < display_size.width || client_size.height < display_size.height {
-                        // TODO: we may have different behaviour instead, such as clipping or scaling?
-                        warn!(
-                            "Client size doesn't fit the server size: {:?} < {:?}",
-                            client_size, display_size
+                    if client_size.width != display_size.width || client_size.height != display_size.height {
+                        info!(
+                            client_w = client_size.width, client_h = client_size.height,
+                            server_w = display_size.width, server_h = display_size.height,
+                            "Client requested different resolution"
+                        );
+                        // Adopt client resolution via request_resize
+                        self.display.lock().await.request_resize(
+                            client_size.width, client_size.height,
                         );
                     }
                 }

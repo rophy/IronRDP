@@ -303,6 +303,10 @@ impl EncoderIter<'_> {
                     DisplayUpdate::HidePointer => UpdateEncoder::hide_pointer(),
                     DisplayUpdate::DefaultPointer => UpdateEncoder::default_pointer(),
                     DisplayUpdate::Resize(_) => return None,
+                    DisplayUpdate::GfxFrame(_) => {
+                        // GFX frames are handled separately in the server loop, not through the encoder
+                        return None;
+                    }
                 },
                 State::BitmapDiffs { diffs, bitmap, pos } => {
                     let Some(rect) = diffs.get(pos) else {

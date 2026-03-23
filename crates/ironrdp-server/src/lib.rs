@@ -11,6 +11,7 @@ mod capabilities;
 mod clipboard;
 mod display;
 mod encoder;
+pub mod gfx;
 mod handler;
 #[cfg(feature = "helper")]
 mod helper;

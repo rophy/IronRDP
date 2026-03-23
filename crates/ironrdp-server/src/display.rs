@@ -20,11 +20,33 @@ pub use ironrdp_graphics::image_processing::PixelFormat;
 pub enum DisplayUpdate {
     Resize(DesktopSize),
     Bitmap(BitmapUpdate),
+    /// GFX H.264 frame update (requires RDPGFX channel)
+    GfxFrame(GfxFrameUpdate),
     PointerPosition(PointerPositionAttribute),
     ColorPointer(ColorPointer),
     RGBAPointer(RGBAPointer),
     HidePointer,
     DefaultPointer,
+}
+
+/// H.264 encoded frame for GFX pipeline
+#[derive(Debug, Clone)]
+pub struct GfxFrameUpdate {
+    /// H.264 NAL units (Annex B format).
+    /// In AVC420 mode: complete frame. In AVC444 mode: Main View (stream1).
+    pub h264_data: Bytes,
+    /// Visible display width
+    pub width: u16,
+    /// Visible display height
+    pub height: u16,
+    /// H.264 encoded width (aligned to 16)
+    pub enc_width: u16,
+    /// H.264 encoded height (aligned to 16)
+    pub enc_height: u16,
+    pub is_keyframe: bool,
+    /// AVC444 Auxiliary View H.264 data (stream2).
+    /// None = AVC420 mode, Some = AVC444 mode.
+    pub h264_aux: Option<Bytes>,
 }
 
 #[derive(Clone)]
@@ -294,6 +316,11 @@ pub trait RdpServerDisplay: Send {
     /// Request a new size for the display
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         debug!(?layout, "Requesting layout")
+    }
+
+    /// Request a specific resolution (called during client capability negotiation)
+    fn request_resize(&mut self, _width: u16, _height: u16) {
+        // Default: ignore. Override in display implementations that support dynamic resolution.
     }
 }
 
