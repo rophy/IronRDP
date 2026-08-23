@@ -53,7 +53,7 @@ qoicoubeh = { version = "0.5", optional = true }
 zstd-safe = { version = "7.2", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "net", "io-util"] }
 
 [lints]
 workspace = true
