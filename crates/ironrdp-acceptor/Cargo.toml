@@ -13,7 +13,6 @@ categories.workspace = true
 
 [lib]
 doctest = false
-test = false
 
 [dependencies]
 ironrdp-core = { path = "../ironrdp-core", version = "0.1", features = ["alloc"] } # public
