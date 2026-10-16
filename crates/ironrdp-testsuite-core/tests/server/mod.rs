@@ -2,6 +2,7 @@ mod acceptor;
 mod autodetect;
 mod connection_policy;
 mod credential_validator;
+mod credssp_error_code;
 mod fast_path;
 mod finalize_timeout;
 mod multitransport_finalize;

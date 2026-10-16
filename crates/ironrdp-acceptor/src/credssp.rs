@@ -1,6 +1,6 @@
 use ironrdp_async::NetworkClient;
 use ironrdp_connector::sspi::credssp::{
-    CredSspServer, CredentialsProxy, ServerError, ServerMode, ServerState, TsRequest,
+    CredSspServer, CredentialsProxy, NStatusCode, ServerError, ServerMode, ServerState, TsRequest,
 };
 use ironrdp_connector::sspi::generator::{Generator, GeneratorState};
 use ironrdp_connector::sspi::{self, AuthIdentity, KerberosServerConfig, NegotiateConfig, NetworkRequest, Username};
@@ -30,6 +30,18 @@ impl PduHint for CredsspTsRequestHint {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(other_err!("CredsspTsRequestHint", source: e)),
         }
+    }
+}
+
+/// Error code for the client when CredSSP fails. A wrong password fails the NTLM MIC check
+/// (`MessageAltered`) and an unknown user gives `LogonDenied`. Windows sends
+/// STATUS_LOGON_FAILURE for both; mstsc shows "credentials did not work" only for that code
+/// and otherwise falls back to another security protocol.
+#[doc(hidden)]
+pub fn client_error_code(error: &sspi::Error) -> Option<NStatusCode> {
+    match error.error_type {
+        sspi::ErrorKind::MessageAltered | sspi::ErrorKind::LogonDenied => Some(NStatusCode::LOGON_FAILURE),
+        _ => None,
     }
 }
 
@@ -157,11 +169,16 @@ impl<'a> CredsspSequence<'a> {
         let (ts_request, next_state, credentials) = match result {
             Ok(ServerState::ReplyNeeded(ts_request)) => (Some(ts_request), CredsspState::Ongoing, None),
             Ok(ServerState::Finished(id)) => (None, CredsspState::Finished, Some(id)),
-            Err(err) => (
-                err.ts_request.map(|ts_request| *ts_request),
-                CredsspState::ServerError(err.error),
-                None,
-            ),
+            Err(err) => {
+                let ts_request = err.ts_request.map(|ts_request| {
+                    let mut ts_request = *ts_request;
+                    if let Some(code) = client_error_code(&err.error) {
+                        ts_request.error_code = Some(code);
+                    }
+                    ts_request
+                });
+                (ts_request, CredsspState::ServerError(err.error), None)
+            }
         };
 
         self.state = next_state;
