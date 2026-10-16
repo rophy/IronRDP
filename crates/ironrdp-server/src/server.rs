@@ -3467,22 +3467,7 @@ impl RdpServer {
                 }
                 ServerEvent::Disconnect(error) => {
                     debug!(?error, "Got disconnect event");
-                    if !conn.client_supports_errinfo {
-                        // Same MS-RDPBCGR 3.3.5.7.1 rule as the eviction arm.
-                        debug!("client did not opt into Set Error Info PDUs; disconnecting without the reason");
-                        return Ok(RunState::Disconnect);
-                    }
-                    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
-                    // pduSource=0, not user_channel_id -- same MS-RDPBCGR
-                    // 2.2.5.1.1 requirement as the EvictedByOtherConnection
-                    // arm above; upstream's original call here (before this
-                    // merge) predated that parameter and used
-                    // user_channel_id, which this fixes to match.
-                    let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
-                    writer
-                        .write_all(&data)
-                        .await
-                        .map_err(|e| ServerError::io("send server set error info", e))?;
+                    send_disconnect_error_info(conn, writer, error, io_channel_id, user_channel_id).await?;
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::GetLocalAddr(tx) => {
@@ -4298,7 +4283,23 @@ impl RdpServer {
         } else {
             None
         };
-        let mut display_updates = self.display.lock().await.updates().await?;
+        let display_updates = self.display.lock().await.updates().await;
+        let mut display_updates = match display_updates {
+            Ok(display_updates) => display_updates,
+            Err(error) => {
+                // Tell the client why it is going away (for example, the host
+                // denied screen capture) instead of dropping it with no reason.
+                warn!(%error, "Display backend failed to start; disconnecting the client");
+                let error_info =
+                    ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerInsufficientPrivileges);
+                if let Err(send_error) =
+                    send_disconnect_error_info(conn, writer, error_info, io_channel_id, user_channel_id).await
+                {
+                    debug!(%send_error, "could not send the disconnect reason");
+                }
+                return Err(error);
+            }
+        };
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -5501,6 +5502,32 @@ fn encode_heartbeat(config: &HeartbeatConfig, message_channel_id: u16, user_chan
         user_data,
     };
     encode_vec(&X224(mcs_pdu)).map_err(ServerError::encode)
+}
+
+/// Sends the Server Set Error Info PDU that tells the client why the server
+/// disconnects it. The caller then ends the connection.
+///
+/// MS-RDPBCGR 3.3.5.7.1: a client that did not set `RNS_UD_CS_SUPPORT_ERRINFO_PDU`
+/// MUST NOT be sent this PDU, so nothing is sent to such a client.
+async fn send_disconnect_error_info(
+    conn: &ConnectionState,
+    writer: &mut impl FramedWrite,
+    error: ErrorInfo,
+    io_channel_id: u16,
+    user_channel_id: u16,
+) -> ServerResult<()> {
+    if !conn.client_supports_errinfo {
+        debug!("client did not opt into Set Error Info PDUs; disconnecting without the reason");
+        return Ok(());
+    }
+    let pdu = rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(error));
+    // pduSource=0, not user_channel_id: MS-RDPBCGR 2.2.5.1.1 requires it for
+    // TS_SET_ERROR_INFO_PDU.
+    let data = encode_share_data_pdu(pdu, 0, io_channel_id, user_channel_id)?;
+    writer
+        .write_all(&data)
+        .await
+        .map_err(|e| ServerError::io("send server set error info", e))
 }
 
 /// Encode a Share Data PDU wrapped in a Share Control header and carried in an

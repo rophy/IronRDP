@@ -39,7 +39,7 @@ use ironrdp_rdpdr::pdu::efs::{
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_rdpdr::{Rdpdr, RdpdrBackend, RdpdrBackendFactory, RdpdrBackendProduct, RdpdrDrive};
-use ironrdp_server::{GfxServerFactory, ServerEventSender};
+use ironrdp_server::{GfxServerFactory, ServerErrorExt as _, ServerEventSender};
 use ironrdp_testsuite_extra as _;
 use ironrdp_tls::TlsStream;
 use ironrdp_tokio::TokioStream;
@@ -388,6 +388,106 @@ async fn display_control_channel_is_not_created_when_the_display_declines_it() {
         !display_control_started,
         "a display that declines Display Control must not get the channel created on the client"
     );
+}
+
+/// When the display backend cannot start (for example, the host denied screen
+/// capture), the server tells the client why with a Set Error Info PDU before
+/// it ends the connection, instead of dropping it with no reason.
+#[tokio::test]
+async fn a_display_that_fails_to_start_sends_error_info_before_disconnect() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(FailingDisplay)
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind listener");
+    let server_addr = listener.local_addr().expect("listener address");
+
+    let local = tokio::task::LocalSet::new();
+    let (server_result, terminate_reason) = local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.expect("accept connection");
+                server.run_connection(stream).await
+            });
+
+            let client = tokio::task::spawn_local(async move {
+                let (mut stage, _activation_factory, mut framed) =
+                    connect_active_client(server_addr, default_client_config(), None).await;
+                let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    let read_result = tokio::time::timeout(Duration::from_millis(500), framed.read_pdu()).await;
+                    let (action, frame) = match read_result {
+                        Ok(Ok(pdu)) => pdu,
+                        // The server closed the connection without saying why.
+                        Ok(Err(_)) => return None,
+                        Err(_) => continue,
+                    };
+                    for output in stage.process(&mut image, action, &frame).expect("stage process") {
+                        match output {
+                            ActiveStageOutput::Terminate(reason) => return Some(reason),
+                            ActiveStageOutput::ResponseFrame(frame) => {
+                                // The server may already be gone.
+                                let _ = framed.write_all(&frame).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            });
+
+            let (server, client) = tokio::join!(server, client);
+            (server.expect("server task"), client.expect("client task"))
+        })
+        .await;
+
+    let reason = terminate_reason.expect("the client must receive a Set Error Info PDU before the disconnect");
+    assert_eq!(
+        reason.description(),
+        ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerInsufficientPrivileges).description(),
+    );
+    assert!(
+        server_result.is_err(),
+        "the display error must still end the connection with an error"
+    );
+}
+
+struct FailingDisplay;
+
+#[async_trait::async_trait]
+impl RdpServerDisplay for FailingDisplay {
+    async fn size(&mut self) -> DesktopSize {
+        DesktopSize {
+            width: DESKTOP_WIDTH,
+            height: DESKTOP_HEIGHT,
+        }
+    }
+
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        Err(server::ServerError::reason(
+            "display",
+            "screen capture is not permitted",
+        ))
+    }
 }
 
 /// Connects a real client that registers a Display Control channel and an
