@@ -56,7 +56,7 @@ pub use server::{
     AutoReconnectCookieHandle, BoundConnection, ConnectionBinder, ConnectionHandler, ConnectionInfo, ConnectionPolicy,
     CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
-    ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
+    ServerEventSender, StaticChannelFactory, TransportTls, audio_playback_wanted, pick_remotefx_entropy_coder,
 };
 pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 #[cfg(feature = "usb")]

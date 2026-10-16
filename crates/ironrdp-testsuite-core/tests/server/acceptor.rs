@@ -24,7 +24,7 @@ use ironrdp_pdu::gcc::{
 use ironrdp_pdu::mcs::{self, ConnectInitial};
 use ironrdp_pdu::nego::{self, SecurityProtocol};
 use ironrdp_pdu::rdp::ClientInfoPdu;
-use ironrdp_pdu::rdp::client_info::{CompressionType, Credentials};
+use ironrdp_pdu::rdp::client_info::{ClientInfoFlags, CompressionType, Credentials};
 use ironrdp_pdu::rdp::finalization_messages::{ControlAction, ControlPdu, SynchronizePdu};
 use ironrdp_pdu::rdp::headers::{
     BasicSecurityHeader, BasicSecurityHeaderFlags, CompressionFlags, ShareControlHeader, ShareControlPdu,
@@ -262,6 +262,16 @@ fn drive_to_secure_settings_exchange(
     acceptor: &mut Acceptor,
     client_blocks: ironrdp_pdu::gcc::ClientGccBlocks,
 ) -> (u16, u16, Option<u16>, Option<MultiTransportFlags>) {
+    drive_to_secure_settings_exchange_with_client_info(acceptor, client_blocks, &CLIENT_INFO_PDU_BUFFER)
+}
+
+/// Same as `drive_to_secure_settings_exchange`, with the given encoded Client
+/// Info PDU in place of `CLIENT_INFO_PDU_BUFFER`.
+fn drive_to_secure_settings_exchange_with_client_info(
+    acceptor: &mut Acceptor,
+    client_blocks: ironrdp_pdu::gcc::ClientGccBlocks,
+    client_info_pdu: &[u8],
+) -> (u16, u16, Option<u16>, Option<MultiTransportFlags>) {
     let request_bytes = encode_connection_request(SecurityProtocol::SSL);
     acceptor.step(&request_bytes, None, &mut WriteBuf::new()).unwrap();
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap();
@@ -324,7 +334,7 @@ fn drive_to_secure_settings_exchange(
     // RdpSecurityCommencement (no input) -> SecureSettingsExchange, then the
     // Client Info PDU on the I/O channel.
     acceptor.step(&[], None, &mut WriteBuf::new()).unwrap();
-    let client_info = encode_send_data_request(user_channel_id, io_channel_id, &CLIENT_INFO_PDU_BUFFER);
+    let client_info = encode_send_data_request(user_channel_id, io_channel_id, client_info_pdu);
     acceptor.step(&client_info, None, &mut WriteBuf::new()).unwrap();
 
     (
@@ -1101,4 +1111,69 @@ async fn credssp_authorization_uses_selected_protocol(
     assert_eq!(handler.received[0].credentials.domain.as_deref(), expected_domain);
     assert_eq!(handler.received[0].credentials.password, "secret");
     assert_eq!(handler.capability_calls, usize::from(!reject_credentials));
+}
+
+/// Runs a whole TLS connection sequence with a Client Info PDU carrying `flags`
+/// and returns the acceptor result.
+fn accept_with_client_info_flags(flags: ClientInfoFlags) -> ironrdp_acceptor::AcceptorResult {
+    let mut acceptor = multitransport_acceptor(None);
+
+    let mut client_info = CLIENT_INFO_UNICODE.clone();
+    client_info.flags = flags;
+    let client_info_pdu = encode_vec(&ClientInfoPdu {
+        security_header: BasicSecurityHeader {
+            flags: BasicSecurityHeaderFlags::INFO_PKT,
+        },
+        client_info,
+    })
+    .unwrap();
+
+    let client_blocks = client_gcc_with_message_channel_and_multitransport(None);
+    let (user_channel_id, io_channel_id, ..) =
+        drive_to_secure_settings_exchange_with_client_info(&mut acceptor, client_blocks, &client_info_pdu);
+
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // LicensingExchange
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // MultitransportBootstrapping
+    acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // CapabilitiesSendServer
+
+    let confirm_active = encode_send_data_request(user_channel_id, io_channel_id, &CLIENT_DEMAND_ACTIVE_PDU_BUFFER);
+    acceptor.step(&confirm_active, None, &mut WriteBuf::new()).unwrap();
+
+    for pdu in [
+        ShareDataPdu::Synchronize(SynchronizePdu { target_user_id: 0 }),
+        ShareDataPdu::Control(ControlPdu {
+            action: ControlAction::Cooperate,
+            grant_id: 0,
+            control_id: 0,
+        }),
+        ShareDataPdu::Control(ControlPdu {
+            action: ControlAction::RequestControl,
+            grant_id: 0,
+            control_id: 0,
+        }),
+        ShareDataPdu::FontList(Default::default()),
+    ] {
+        let bytes = encode_send_data_request(user_channel_id, io_channel_id, &encode_client_share_data(pdu));
+        acceptor.step(&bytes, None, &mut WriteBuf::new()).unwrap();
+    }
+    for _ in 0..4 {
+        acceptor.step(&[], None, &mut WriteBuf::new()).unwrap(); // server confirmations, then FontMap
+    }
+
+    acceptor.get_result().expect("connection sequence completed")
+}
+
+/// The Client Info PDU flags reach the acceptor result, so a server can follow
+/// the client's audio playback mode (MS-RDPBCGR 2.2.1.11.1.1).
+#[test]
+fn client_info_flags_are_exposed_in_the_result() {
+    let base = CLIENT_INFO_UNICODE.flags;
+    assert!(!base.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+
+    let result = accept_with_client_info_flags(base);
+    assert_eq!(result.client_info_flags, base);
+
+    let result = accept_with_client_info_flags(base | ClientInfoFlags::NO_AUDIO_PLAYBACK);
+    assert!(result.client_info_flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
+    assert_eq!(result.client_info_flags, base | ClientInfoFlags::NO_AUDIO_PLAYBACK);
 }

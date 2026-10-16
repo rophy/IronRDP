@@ -12,7 +12,7 @@ use ironrdp_pdu::nego::SecurityProtocol;
 use ironrdp_pdu::x224::X224;
 use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, SvcServerProcessor};
 use pdu::rdp::capability_sets::CapabilitySet;
-use pdu::rdp::client_info::{ClientAutoReconnect, Credentials};
+use pdu::rdp::client_info::{ClientAutoReconnect, ClientInfoFlags, Credentials};
 use pdu::rdp::headers::ShareControlPdu;
 use pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use pdu::rdp::server_license::{LicensePdu, LicensingErrorMessage};
@@ -55,6 +55,7 @@ pub struct Acceptor {
     received_credentials: Option<ReceivedCredentials>,
     credentials_handled: bool,
     received_auto_reconnect: Option<ClientAutoReconnect>,
+    client_info_flags: ClientInfoFlags,
     reactivation: bool,
     honor_client_desktop_size: Option<DesktopSize>,
     /// UDP multitransport flags to advertise to the client and, if it
@@ -244,6 +245,11 @@ pub struct AcceptorResult {
     /// validation, but the server must still verify its security verifier
     /// against the reconnect random for the target session.
     pub auto_reconnect: Option<ClientAutoReconnect>,
+    /// Flags from the Client Info PDU (MS-RDPBCGR 2.2.1.11.1.1), such as the
+    /// client's audio playback mode.
+    ///
+    /// Empty until the Client Info PDU is received.
+    pub client_info_flags: ClientInfoFlags,
 }
 
 impl Acceptor {
@@ -272,6 +278,7 @@ impl Acceptor {
             received_credentials: None,
             credentials_handled: false,
             received_auto_reconnect: None,
+            client_info_flags: ClientInfoFlags::empty(),
             reactivation: false,
             honor_client_desktop_size: None,
             offer_multitransport: None,
@@ -508,6 +515,7 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             credentials_handled: consumed.credentials_handled,
             received_auto_reconnect: consumed.received_auto_reconnect,
+            client_info_flags: consumed.client_info_flags,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
             offer_multitransport: consumed.offer_multitransport,
@@ -701,6 +709,7 @@ impl Acceptor {
                 reactivation: self.reactivation,
                 credentials: self.credentials_for_result(),
                 auto_reconnect: self.received_auto_reconnect.take(),
+                client_info_flags: self.client_info_flags,
             }),
             previous_state => {
                 self.state = previous_state;
@@ -1205,6 +1214,7 @@ impl Sequence for Acceptor {
                     "Received Client Info PDU"
                 );
                 self.received_auto_reconnect = auto_reconnect;
+                self.client_info_flags = client_info.client_info.flags;
 
                 if !protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
                     let creds = client_info.client_info.credentials;

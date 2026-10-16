@@ -35,6 +35,7 @@ use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
 use ironrdp_pdu::rdp::capability_sets::{
     BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, EntropyBits, GeneralExtraFlags, LargePointerSupportFlags,
 };
+use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
@@ -43,7 +44,9 @@ use ironrdp_pdu::{Action, PduResult, decode_err, mcs, nego, rdp};
 use ironrdp_rdpdr as rdpdr;
 use ironrdp_rdpeai as rdpeai;
 use ironrdp_rdpsnd as rdpsnd;
-use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
+use ironrdp_svc::{
+    ChannelFlags, StaticChannelId, StaticChannelKey, StaticChannelSet, SvcProcessor, server_encode_svc_messages,
+};
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
 use rand::RngCore as _;
 use rdpdr::server::{RdpdrServer, RdpdrServerMessage};
@@ -149,6 +152,8 @@ pub struct ConnectionInfo {
     /// The client came back with an auto-reconnect cookie the server
     /// verified, in place of its credentials.
     pub auto_reconnect: bool,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_info_flags`].
+    pub client_info_flags: ClientInfoFlags,
 }
 
 impl ConnectionInfo {
@@ -162,6 +167,7 @@ impl ConnectionInfo {
             keyboard_type,
             ime_file_name,
             auto_reconnect: false,
+            client_info_flags: ClientInfoFlags::empty(),
         }
     }
 }
@@ -758,6 +764,13 @@ pub fn pick_remotefx_entropy_coder(
     }
 
     first
+}
+
+/// The client asks for audio on the client unless it set "do not play" or "play on the
+/// remote computer" (MS-RDPBCGR 2.2.1.11.1.1 INFO_NOAUDIOPLAYBACK / INFO_REMOTECONSOLEAUDIO).
+#[doc(hidden)]
+pub fn audio_playback_wanted(flags: ClientInfoFlags) -> bool {
+    !flags.intersects(ClientInfoFlags::NO_AUDIO_PLAYBACK | ClientInfoFlags::REMOTE_CONSOLE_AUDIO)
 }
 
 #[derive(Clone)]
@@ -4687,6 +4700,7 @@ impl RdpServer {
                     keyboard_type: result.keyboard_type,
                     ime_file_name: result.ime_file_name.clone(),
                     auto_reconnect: is_auto_reconnect,
+                    client_info_flags: result.client_info_flags,
                 });
             });
         }
@@ -4722,11 +4736,19 @@ impl RdpServer {
             .client_early_capability_flags
             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
         if !result.reactivation {
-            for (_channel_key, channel, channel_id) in conn.static_channels.iter_by_key_mut() {
+            let audio_playback = audio_playback_wanted(result.client_info_flags);
+            if !audio_playback && conn.get_channel_id_by_type::<RdpsndServer>().is_some() {
+                info!(flags = ?result.client_info_flags, "Client asked for no audio playback, rdpsnd not started");
+            }
+            let rdpsnd_key = StaticChannelKey::Typed(core::any::TypeId::of::<RdpsndServer>());
+            for (channel_key, channel, channel_id) in conn.static_channels.iter_by_key_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
                     continue;
                 };
+                if !audio_playback && channel_key == rdpsnd_key {
+                    continue;
+                }
                 let svc_responses = channel.start().map_err_kind("svc start", ServerErrorKind::Pdu)?;
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)
                     .map_err(ServerError::encode)?;
