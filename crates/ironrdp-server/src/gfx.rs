@@ -27,6 +27,11 @@ pub type GfxServerHandle = Arc<Mutex<GraphicsPipelineServer>>;
 ///
 /// Implements `ServerEventSender` so the factory can signal the server event loop
 /// when EGFX frames are ready to be drained and sent.
+///
+/// The server builds one pipeline per EGFX channel: one for each connection,
+/// and one more for each [`EgfxServerMessage::Reopen`]. An application that
+/// sends frames takes the handle of the newest pipeline from
+/// [`Self::build_server_with_handle`].
 pub trait GfxServerFactory: ServerEventSender + Send {
     /// Create a handler for EGFX callbacks (caps negotiation, frame acks).
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler>;
@@ -109,6 +114,14 @@ pub enum EgfxServerMessage {
     /// Open the EGFX channel again, with a new pipeline from the factory,
     /// after the client closed or declined it. Nothing happens while the
     /// channel is open or being created.
+    ///
+    /// The server calls the factory again
+    /// ([`GfxServerFactory::build_server_with_handle`], else
+    /// [`GfxServerFactory::build_gfx_handler`]); that call is how the
+    /// application gets the new pipeline. Frames sent to the old handle go
+    /// nowhere. [`RdpServer::gfx_handle`](crate::RdpServer::gfx_handle)
+    /// points to the new pipeline too, but is not reachable while
+    /// [`RdpServer::run`](crate::RdpServer::run) owns the server.
     ///
     /// The new channel uses TCP: Soft-Sync (MS-RDPEDYC 3.3.5.3) moves channels
     /// to the UDP transport once per connection.
