@@ -2677,6 +2677,239 @@ async fn connection_info_has_the_client_pointer_capabilities() {
     assert!(!info.client_supports_heartbeat);
 }
 
+/// Plaintext stream that sets SUPPORT_HEART_BEAT_PDU (MS-RDPBCGR 2.2.1.3.2)
+/// in the Client Core Data the IronRDP client writes, which does not set it.
+struct AdvertiseHeartbeat<S> {
+    inner: S,
+    patched: Arc<AtomicBool>,
+}
+
+impl<S> AdvertiseHeartbeat<S> {
+    /// Offset of `earlyCapabilityFlags` from the start of the CS_CORE block.
+    const EARLY_FLAGS_OFFSET: usize = 144;
+
+    fn patch(&self, buf: &[u8]) -> Option<Vec<u8>> {
+        if self.patched.load(Ordering::SeqCst) {
+            return None;
+        }
+        let at = (0..buf.len().saturating_sub(Self::EARLY_FLAGS_OFFSET + 2)).find(|&i| {
+            // CS_CORE header (type 0xC001, length) and a version 8.x.
+            buf[i..i + 2] == [0x01, 0xC0]
+                && usize::from(u16::from_le_bytes([buf[i + 2], buf[i + 3]])) >= Self::EARLY_FLAGS_OFFSET + 2
+                && buf[i + 6..i + 8] == [0x08, 0x00]
+        })?;
+        let flags_at = at + Self::EARLY_FLAGS_OFFSET;
+        let flags = u16::from_le_bytes([buf[flags_at], buf[flags_at + 1]])
+            | gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU.bits();
+        let mut patched = buf.to_vec();
+        patched[flags_at..flags_at + 2].copy_from_slice(&flags.to_le_bytes());
+        Some(patched)
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AdvertiseHeartbeat<S> {
+    fn poll_read(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        core::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for AdvertiseHeartbeat<S> {
+    fn poll_write(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+        buf: &[u8],
+    ) -> core::task::Poll<std::io::Result<usize>> {
+        let Some(patched) = self.patch(buf) else {
+            return core::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        };
+        let result = core::pin::Pin::new(&mut self.inner).poll_write(cx, &patched);
+        if let core::task::Poll::Ready(Ok(written)) = result
+            && written == patched.len()
+        {
+            self.patched.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        core::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        core::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Connects a client, asks the server through its
+/// [`server::heartbeat::HeartbeatHandle`] for heartbeats until one arrives (or
+/// 1 s passes), and returns `ConnectionInfo::client_supports_heartbeat` and
+/// the Heartbeat PDU the client got on the message channel.
+async fn on_demand_heartbeat(advertise: bool) -> (bool, Option<pdu::rdp::heartbeat::HeartbeatPdu>) {
+    struct InfoRecorder(Arc<StdMutex<Option<server::ConnectionInfo>>>);
+
+    impl server::ConnectionHandler for InfoRecorder {
+        fn on_connection_info(&mut self, info: &server::ConnectionInfo) {
+            *self.0.lock().unwrap() = Some(info.clone());
+        }
+    }
+
+    const CONFIG: server::heartbeat::HeartbeatConfig = server::heartbeat::HeartbeatConfig {
+        period_secs: 200,
+        warning_count: 7,
+        reconnect_count: 9,
+    };
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+    let info = Arc::new(StdMutex::new(None));
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
+        })
+        .with_connection_handler(Some(Box::new(InfoRecorder(Arc::clone(&info)))))
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let heartbeats = server.heartbeat_handle();
+    let ev = server.event_sender().clone();
+    let patched = Arc::new(AtomicBool::new(false));
+    let patched_by_client = Arc::clone(&patched);
+
+    let local = tokio::task::LocalSet::new();
+    let received = local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+            let client = tokio::task::spawn_local(async move {
+                let server_addr = local_addr_of(&ev).await;
+
+                let tcp_stream = TcpStream::connect(server_addr).await.expect("TCP connect");
+                let client_addr = tcp_stream.local_addr().expect("local_addr");
+                let mut framed = ironrdp_tokio::TokioFramed::new(tcp_stream);
+                let mut connector = connector::ClientConnector::new(default_client_config(), client_addr);
+                let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector)
+                    .await
+                    .expect("begin connection");
+                let (upgraded_stream, tls_cert) = ironrdp_tls::upgrade_with_certificate_validation(
+                    framed.into_inner_no_leftover(),
+                    "localhost",
+                    ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate,
+                )
+                .await
+                .expect("TLS upgrade");
+                let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+                if !advertise {
+                    patched_by_client.store(true, Ordering::SeqCst);
+                }
+                let mut framed = ironrdp_tokio::TokioFramed::new(AdvertiseHeartbeat {
+                    inner: upgraded_stream,
+                    patched: Arc::clone(&patched_by_client),
+                });
+                let server_public_key =
+                    ironrdp_tls::extract_tls_server_public_key(&tls_cert).expect("extract server public key");
+                let result = ironrdp_async::connect_finalize(
+                    upgraded,
+                    connector,
+                    &mut framed,
+                    &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                    "localhost".into(),
+                    server_public_key.to_owned(),
+                    None,
+                )
+                .await
+                .expect("finalize connection");
+                let message_channel_id = result.message_channel_id.expect("a message channel");
+
+                // The client loop drops requests from before it started, so ask
+                // again until one arrives.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                let mut received = None;
+                while received.is_none() {
+                    heartbeats.send(CONFIG);
+                    let Ok(pdu) = tokio::time::timeout_at(
+                        deadline.min(tokio::time::Instant::now() + Duration::from_millis(50)),
+                        framed.read_pdu(),
+                    )
+                    .await
+                    else {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        continue;
+                    };
+                    let (action, frame) = pdu.expect("read PDU");
+                    if action != pdu::Action::X224 {
+                        continue;
+                    }
+                    let Ok(pdu::x224::X224(indication)) =
+                        ironrdp::core::decode::<pdu::x224::X224<pdu::mcs::SendDataIndication<'_>>>(&frame)
+                    else {
+                        continue;
+                    };
+                    if indication.channel_id == message_channel_id {
+                        received =
+                            ironrdp::core::decode::<pdu::rdp::heartbeat::HeartbeatPdu>(&indication.user_data).ok();
+                    }
+                }
+                drop(framed);
+                received
+            });
+            let received = client.await.expect("client");
+            server_task.abort();
+            received
+        })
+        .await;
+
+    assert!(patched.load(Ordering::SeqCst), "the client wrote its core data");
+    let info = info.lock().unwrap().clone().expect("on_connection_info was called");
+    if let Some(heartbeat) = &received {
+        assert_eq!(
+            (heartbeat.period, heartbeat.count1, heartbeat.count2),
+            (CONFIG.period_secs, CONFIG.warning_count, CONFIG.reconnect_count)
+        );
+    }
+    (info.client_supports_heartbeat, received)
+}
+
+/// A client that advertises heartbeats is told so in `ConnectionInfo`, and
+/// [`server::heartbeat::HeartbeatHandle::send`] puts a Heartbeat PDU on its
+/// message channel.
+#[tokio::test]
+async fn on_demand_heartbeat_reaches_a_client_that_advertises_it() {
+    let (supports, received) = on_demand_heartbeat(true).await;
+    assert!(supports);
+    assert!(received.is_some(), "a Heartbeat PDU");
+}
+
+/// A client that does not advertise heartbeats gets none.
+#[tokio::test]
+async fn on_demand_heartbeat_skips_a_client_without_it() {
+    let (supports, received) = on_demand_heartbeat(false).await;
+    assert!(!supports);
+    assert!(received.is_none());
+}
+
 /// Counts how often each `ConnectionHandler` hook reached the handler.
 /// `on_accept` fires before a connection is served, `on_connection_info`
 /// mid-connection, `on_disconnected` after it ends.

@@ -68,7 +68,7 @@ use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResu
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxServerFactory};
 use crate::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
-use crate::heartbeat::HeartbeatConfig;
+use crate::heartbeat::{HeartbeatConfig, HeartbeatHandle};
 use crate::multitransport;
 use crate::rdpeai::RdpeaiServerFactory;
 use crate::rdpei::RdpeiServerFactory;
@@ -167,7 +167,8 @@ pub struct ConnectionInfo {
     /// empty when the client sent none, so pointer shapes are limited to 32x32.
     pub large_pointer_flags: LargePointerSupportFlags,
     /// The client advertised `SUPPORT_HEART_BEAT_PDU` and has a message
-    /// channel, so [`ServerEvent::Heartbeat`] reaches it.
+    /// channel, so heartbeats ([`RdpServer::enable_heartbeat`],
+    /// [`RdpServer::heartbeat_handle`]) reach it.
     pub client_supports_heartbeat: bool,
 }
 
@@ -1054,6 +1055,8 @@ pub struct RdpServer {
     /// Whether each connection runs auto-detect; see [`Self::enable_autodetect`].
     autodetect_enabled: bool,
     heartbeat: Option<HeartbeatConfig>,
+    /// On-demand heartbeats; see [`Self::heartbeat_handle`].
+    heartbeat_requests: HeartbeatHandle,
     /// Shared, not owned outright: under [`ConnectionPolicy::Preempt`] the live
     /// connection (which borrows `self` for the whole race) and a candidate's
     /// `on_accept` must both reach the handler. Reach it only through
@@ -1256,12 +1259,6 @@ pub enum ServerEvent {
     Egfx(EgfxServerMessage),
     /// Trigger an RTT measurement probe (requires auto-detect enabled).
     AutoDetectRttRequest,
-    /// Send one Server Heartbeat PDU now (MS-RDPBCGR 2.2.16.1) with the given
-    /// values, if the client advertised heartbeat support and has a message
-    /// channel ([`ConnectionInfo::client_supports_heartbeat`]); otherwise nothing.
-    /// The client sends no reply. Use it to put a small packet on the wire on
-    /// demand, besides or without [`RdpServer::enable_heartbeat`].
-    Heartbeat(HeartbeatConfig),
     #[cfg(feature = "usb")]
     Usb(UrbdrcServerMessage),
 }
@@ -1295,7 +1292,6 @@ impl fmt::Debug for ServerEvent {
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
-            Self::Heartbeat(config) => f.debug_tuple("Heartbeat").field(config).finish(),
         }
     }
 }
@@ -2036,6 +2032,7 @@ impl RdpServer {
             connection_local_addr: None,
             autodetect_enabled: false,
             heartbeat: None,
+            heartbeat_requests: HeartbeatHandle::default(),
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             recently_evicted: None,
             display_suppressed: display_suppressed.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
@@ -2539,6 +2536,12 @@ impl RdpServer {
     /// during the previous heartbeat interval.
     pub fn enable_heartbeat(&mut self, config: HeartbeatConfig) {
         self.heartbeat = Some(config);
+    }
+
+    /// Returns a handle that sends one Heartbeat PDU on demand while
+    /// [`Self::run`] owns this server; see [`HeartbeatHandle::send`].
+    pub fn heartbeat_handle(&self) -> HeartbeatHandle {
+        self.heartbeat_requests.clone()
     }
 
     /// Returns the shared EGFX server handle for proactive frame submission.
@@ -4063,20 +4066,6 @@ impl RdpServer {
                         self.reopen_egfx(conn, writer, user_channel_id).await?;
                     }
                 },
-                ServerEvent::Heartbeat(config) => {
-                    // Heartbeats ride the MCS message channel (MS-RDPBCGR 2.2.16.1),
-                    // and only a client that advertised them gets them.
-                    match message_channel_id {
-                        Some(message_channel_id) if conn.client_supports_heartbeat => {
-                            let data = encode_heartbeat(&config, message_channel_id, user_channel_id)?;
-                            writer
-                                .write_all(&data)
-                                .await
-                                .map_err(|e| ServerError::io("send heartbeat", e))?;
-                        }
-                        _ => trace!("Heartbeat not sent: the client did not advertise it"),
-                    }
-                }
                 ServerEvent::AutoDetectRttRequest => {
                     // Auto-detect requests ride the MCS message channel
                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
@@ -4451,11 +4440,15 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let heartbeat = if conn.client_supports_heartbeat {
+        let client_supports_heartbeat = conn.client_supports_heartbeat;
+        let heartbeat = if client_supports_heartbeat {
             self.heartbeat
         } else {
             None
         };
+        let heartbeat_requests = self.heartbeat_requests.clone();
+        // A request from before this loop has no client to go to.
+        let _stale = heartbeat_requests.take();
         let display_updates = self.display.lock().await.updates().await;
         let mut display_updates = match display_updates {
             Ok(display_updates) => display_updates,
@@ -4655,32 +4648,55 @@ impl RdpServer {
         };
 
         let send_heartbeats = async move {
-            let (Some(config), Some(message_channel_id)) = (heartbeat, message_channel_id) else {
-                return core::future::pending::<ServerResult<RunState>>().await;
+            let Some(message_channel_id) = message_channel_id.filter(|_| client_supports_heartbeat) else {
+                // 2.2.16.1: heartbeats ride the message channel, and only a
+                // client that advertised them gets them.
+                loop {
+                    let _ = heartbeat_requests.requested().await;
+                    trace!("Heartbeat not sent: the client did not advertise it");
+                }
             };
-            // 2.2.16.1: `period` is in seconds. A zero period is meaningless
-            // (and would panic tokio's interval), so it is bumped to one.
-            let period = Duration::from_secs(u64::from(config.period_secs.max(1)));
-            let mut interval = tokio::time::interval(period);
-            // A stalled write (TCP back-pressure) can hold this future past
-            // several tick deadlines; Burst (the default) would then fire the
-            // missed ticks back-to-back and emit a run of consecutive
-            // heartbeats on an otherwise idle link. Skip fires at the next
-            // period boundary instead.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await; // first tick completes immediately; real waits start below
+            // Periodic heartbeats only with `enable_heartbeat`.
+            let mut periodic = heartbeat.map(|config| {
+                // 2.2.16.1: `period` is in seconds. A zero period is meaningless
+                // (and would panic tokio's interval), so it is bumped to one.
+                let period = Duration::from_secs(u64::from(config.period_secs.max(1)));
+                let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                // A stalled write (TCP back-pressure) can hold this future past
+                // several tick deadlines; Burst (the default) would then fire the
+                // missed ticks back-to-back and emit a run of consecutive
+                // heartbeats on an otherwise idle link. Skip fires at the next
+                // period boundary instead.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                (config, interval)
+            });
 
             let mut writes_at_last_tick = write_counter.load(Ordering::Relaxed);
             loop {
-                interval.tick().await;
-                let writes_now = write_counter.load(Ordering::Relaxed);
-                if writes_now != writes_at_last_tick {
-                    // 2.2.16.1: heartbeats SHOULD only be sent when no other
-                    // PDU went out in the interval; ordinary traffic doubles
-                    // as the liveness signal.
-                    writes_at_last_tick = writes_now;
-                    continue;
-                }
+                let config = tokio::select! {
+                    config = heartbeat_requests.requested() => config,
+                    () = async {
+                        match periodic.as_mut() {
+                            Some((_, interval)) => {
+                                interval.tick().await;
+                            }
+                            None => core::future::pending().await,
+                        }
+                    } => {
+                        let writes_now = write_counter.load(Ordering::Relaxed);
+                        if writes_now != writes_at_last_tick {
+                            // 2.2.16.1: heartbeats SHOULD only be sent when no other
+                            // PDU went out in the interval; ordinary traffic doubles
+                            // as the liveness signal.
+                            writes_at_last_tick = writes_now;
+                            continue;
+                        }
+                        match periodic.as_ref() {
+                            Some((config, _)) => *config,
+                            None => continue,
+                        }
+                    }
+                };
                 let data = encode_heartbeat(&config, message_channel_id, user_channel_id)?;
                 heartbeat_writer
                     .write_all(&data)
@@ -6736,59 +6752,6 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
-    }
-
-    async fn heartbeat_bytes(supports_heartbeat: bool, message_channel_id: Option<u16>) -> Vec<u8> {
-        let mut server = RdpServer::builder()
-            .with_addr((Ipv4Addr::LOCALHOST, 0))
-            .with_no_security()
-            .with_no_input()
-            .with_no_display()
-            .build();
-        let mut conn = ConnectionState {
-            client_supports_heartbeat: supports_heartbeat,
-            ..ConnectionState::default()
-        };
-        let config = HeartbeatConfig {
-            period_secs: 255,
-            warning_count: 255,
-            reconnect_count: 255,
-        };
-        let mut events = vec![ServerEvent::Heartbeat(config)];
-        let mut writer = CapturingWriter::default();
-        let state = server
-            .dispatch_server_events(
-                &mut conn,
-                &mut events,
-                &mut writer,
-                1003,
-                1002,
-                message_channel_id,
-                None,
-            )
-            .await
-            .expect("heartbeat event");
-        assert!(matches!(state, RunState::Continue));
-        writer.0
-    }
-
-    /// A heartbeat event puts one Heartbeat PDU on the message channel.
-    #[tokio::test]
-    async fn heartbeat_event_sends_a_heartbeat_pdu() {
-        let config = HeartbeatConfig {
-            period_secs: 255,
-            warning_count: 255,
-            reconnect_count: 255,
-        };
-        let expected = encode_heartbeat(&config, 1004, 1002).expect("encode");
-        assert_eq!(heartbeat_bytes(true, Some(1004)).await, expected);
-    }
-
-    /// A client that did not advertise heartbeats, or has no message channel, gets none.
-    #[tokio::test]
-    async fn heartbeat_event_sends_nothing_without_client_support() {
-        assert!(heartbeat_bytes(false, Some(1004)).await.is_empty());
-        assert!(heartbeat_bytes(true, None).await.is_empty());
     }
 }
 

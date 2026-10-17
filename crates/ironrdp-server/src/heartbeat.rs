@@ -1,5 +1,9 @@
 //! Server-side Heartbeat PDU emission (MS-RDPBCGR 2.2.16).
 
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
+
 /// Configuration for periodic Server Heartbeat PDUs (MS-RDPBCGR 2.2.16.1).
 ///
 /// Heartbeats let the client monitor connection health in real time: when it
@@ -34,5 +38,99 @@ impl Default for HeartbeatConfig {
             warning_count: 3,
             reconnect_count: 5,
         }
+    }
+}
+
+/// Cloneable handle that sends one Server Heartbeat PDU on demand, while
+/// [`RdpServer::run`](crate::RdpServer::run) owns the server. Get it from
+/// [`RdpServer::heartbeat_handle`](crate::RdpServer::heartbeat_handle).
+///
+/// Use it to put a small packet on the wire when the application wants one,
+/// besides or without [`RdpServer::enable_heartbeat`](crate::RdpServer::enable_heartbeat).
+/// The client sends no reply.
+#[derive(Clone, Default)]
+pub struct HeartbeatHandle {
+    inner: Arc<HeartbeatRequest>,
+}
+
+#[derive(Default)]
+struct HeartbeatRequest {
+    pending: Mutex<Option<HeartbeatConfig>>,
+    notify: Notify,
+}
+
+impl HeartbeatHandle {
+    /// Send one Heartbeat PDU with `config` to the current client, if it
+    /// advertised heartbeat support and has a message channel
+    /// ([`ConnectionInfo::client_supports_heartbeat`](crate::ConnectionInfo::client_supports_heartbeat));
+    /// otherwise nothing is sent.
+    ///
+    /// Requests that come before the server took the last one are merged into
+    /// one PDU with the newest `config`. A request made while no client is
+    /// connected is dropped when the next client loop starts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock is poisoned (a thread panicked while
+    /// holding it).
+    pub fn send(&self, config: HeartbeatConfig) {
+        *self.inner.pending.lock().expect("heartbeat request lock poisoned") = Some(config);
+        self.inner.notify.notify_one();
+    }
+
+    /// Takes the pending request, if any.
+    pub(crate) fn take(&self) -> Option<HeartbeatConfig> {
+        self.inner
+            .pending
+            .lock()
+            .expect("heartbeat request lock poisoned")
+            .take()
+    }
+
+    /// Waits for the next request. Cancel safe: a request is taken only when
+    /// this returns.
+    pub(crate) async fn requested(&self) -> HeartbeatConfig {
+        loop {
+            if let Some(config) = self.take() {
+                return config;
+            }
+            self.inner.notify.notified().await;
+        }
+    }
+}
+
+impl core::fmt::Debug for HeartbeatHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HeartbeatHandle").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG: HeartbeatConfig = HeartbeatConfig {
+        period_secs: 255,
+        warning_count: 255,
+        reconnect_count: 255,
+    };
+
+    #[tokio::test]
+    async fn a_request_is_taken_once() {
+        let handle = HeartbeatHandle::default();
+        handle.clone().send(HeartbeatConfig::default());
+        handle.send(CONFIG);
+        assert_eq!(handle.requested().await, CONFIG, "the newest config wins");
+        let next = tokio::time::timeout(core::time::Duration::from_millis(20), handle.requested()).await;
+        assert!(next.is_err(), "two requests before a take make one PDU");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_is_not_sent_later() {
+        let handle = HeartbeatHandle::default();
+        handle.send(CONFIG);
+        assert_eq!(handle.take(), Some(CONFIG));
+        let next = tokio::time::timeout(core::time::Duration::from_millis(20), handle.requested()).await;
+        assert!(next.is_err());
     }
 }
