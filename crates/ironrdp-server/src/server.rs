@@ -1,7 +1,6 @@
 use core::cell::RefCell;
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
-#[cfg(feature = "egfx")]
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
