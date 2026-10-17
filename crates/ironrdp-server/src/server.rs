@@ -2,7 +2,6 @@ use core::cell::RefCell;
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
 #[cfg(feature = "egfx")]
-use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
@@ -84,13 +83,6 @@ use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::Urbdr
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
-#[cfg(feature = "egfx")]
-fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZeroU32> {
-    capabilities.iter().find_map(|capability| match capability {
-        CapabilitySet::FrameAcknowledge(capability) => NonZeroU32::new(capability.max_unacknowledged_frame_count),
-        _ => None,
-    })
-}
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long a single [`ironrdp_acceptor::accept_finalize`] pass may take before
@@ -4722,13 +4714,11 @@ impl RdpServer {
             .await?;
         }
 
-        #[cfg(feature = "egfx")]
-        if let Some(gfx_handle) = self.gfx_handle.as_ref() {
-            let mut server = gfx_handle
-                .lock()
-                .map_err(|_| ServerError::reason("graphics server", "GfxServerHandle mutex poisoned"))?;
-            server.set_client_frame_ack_limit(client_core_frame_ack_limit(&result.capabilities));
-        }
+        // The core Frame Acknowledge capability (maxUnacknowledgedFrameCount,
+        // MS-RDPRFX 2.2.1.3) limits frames sent as surface commands with frame
+        // markers. EGFX has its own flow control (MS-RDPEGFX 2.2.2.13 queueDepth),
+        // so the core value is not applied to the EGFX frame window: mstsc
+        // advertises 1 there and shows ~20 fps instead of ~34 with it.
         conn.static_channels = result.static_channels;
         conn.client_supports_heartbeat = result
             .client_early_capability_flags
@@ -6554,32 +6544,6 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
-    }
-}
-
-#[cfg(all(test, feature = "egfx"))]
-mod frame_ack_limit_tests {
-    use super::*;
-    use ironrdp_pdu::rdp::capability_sets::FrameAcknowledge;
-    #[test]
-    fn absent_and_zero_core_limit_are_unconstrained() {
-        assert_eq!(client_core_frame_ack_limit(&[]), None);
-        assert_eq!(
-            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-                max_unacknowledged_frame_count: 0
-            })]),
-            None
-        );
-    }
-    #[test]
-    fn nonzero_core_limit_is_preserved() {
-        assert_eq!(
-            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-                max_unacknowledged_frame_count: 1
-            })])
-            .map(NonZeroU32::get),
-            Some(1)
-        );
     }
 }
 

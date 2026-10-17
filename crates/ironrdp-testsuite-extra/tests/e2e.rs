@@ -1678,6 +1678,197 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
         .await;
 }
 
+/// The core Frame Acknowledge capability (MS-RDPRFX 2.2.1.3) limits surface
+/// commands, not EGFX: the EGFX frame window stays at the server's value when
+/// the client advertises a smaller core value.
+#[tokio::test]
+async fn core_frame_ack_capability_does_not_limit_the_egfx_window() {
+    let client_config = connector::Config {
+        support_dyn_vc_gfx_protocol: true,
+        // With a bitmap codec the client advertises Frame Acknowledge
+        // (maxUnacknowledgedFrameCount 20).
+        bitmap: Some(connector::BitmapConfig {
+            lossy_compression: true,
+            color_depth: 32,
+            codecs: pdu::rdp::capability_sets::client_codecs_capabilities(&["remotefx:on"]).expect("codecs"),
+        }),
+        ..default_client_config()
+    };
+    egfx_session(client_config, 30, |mut session| async move {
+        session.wait_for_egfx().await;
+        let handle = session
+            .handles
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("an EGFX pipeline");
+        assert_eq!(handle.lock().unwrap().max_frames_in_flight(), 30);
+        session
+    })
+    .await;
+}
+
+/// EGFX factory that keeps the pipeline of every channel it builds.
+struct HandleGfxFactory {
+    caps_tx: UnboundedSender<()>,
+    handles: Arc<StdMutex<Vec<ironrdp_server::GfxServerHandle>>>,
+    max_frames_in_flight: u32,
+}
+
+impl ServerEventSender for HandleGfxFactory {
+    fn set_sender(&mut self, _sender: UnboundedSender<ServerEvent>) {}
+}
+
+impl GfxServerFactory for HandleGfxFactory {
+    fn build_gfx_handler(&self) -> Box<dyn ironrdp_egfx::server::GraphicsPipelineHandler> {
+        Box::new(TestGfxHandler {
+            caps_tx: self.caps_tx.clone(),
+        })
+    }
+
+    fn build_server_with_handle(&self) -> Option<(ironrdp_server::GfxDvcBridge, ironrdp_server::GfxServerHandle)> {
+        let mut server = ironrdp_egfx::server::GraphicsPipelineServer::new(self.build_gfx_handler());
+        server.set_max_frames_in_flight(self.max_frames_in_flight);
+        let handle = Arc::new(StdMutex::new(server));
+        self.handles.lock().unwrap().push(Arc::clone(&handle));
+        Some((ironrdp_server::GfxDvcBridge::new(Arc::clone(&handle)), handle))
+    }
+}
+
+/// Client side of a connection with an EGFX channel (TCP only).
+struct EgfxSession {
+    stage: ActiveStage,
+    framed: Framed<TokioStream<TlsStream<TcpStream>>>,
+    image: DecodedImage,
+    caps_rx: UnboundedReceiver<()>,
+    /// Every pipeline the server built, oldest first.
+    handles: Arc<StdMutex<Vec<ironrdp_server::GfxServerHandle>>>,
+}
+
+impl EgfxSession {
+    /// Process server PDUs (and send the client's replies) until the server's
+    /// EGFX handler got the client's capabilities.
+    async fn wait_for_egfx(&mut self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    caps = self.caps_rx.recv() => {
+                        caps.expect("capabilities reached the EGFX handler");
+                        break;
+                    }
+                    pdu = self.framed.read_pdu() => {
+                        let (action, frame) = pdu.expect("read PDU");
+                        self.handle_pdu(action, &frame).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the EGFX channel opened");
+    }
+
+    async fn handle_pdu(&mut self, action: pdu::Action, frame: &[u8]) {
+        for output in self
+            .stage
+            .process(&mut self.image, action, frame)
+            .expect("stage process")
+        {
+            if let ActiveStageOutput::ResponseFrame(frame) = output {
+                self.framed.write_all(&frame).await.expect("write response frame");
+            }
+        }
+    }
+}
+
+async fn egfx_session<F, Fut>(client_config: connector::Config, max_frames_in_flight: u32, clientfn: F)
+where
+    F: FnOnce(EgfxSession) -> Fut + 'static,
+    Fut: Future<Output = EgfxSession>,
+{
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (caps_tx, caps_rx) = mpsc::unbounded_channel();
+    let handles = Arc::new(StdMutex::new(Vec::new()));
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
+        })
+        .with_gfx_factory(Some(Box::new(HandleGfxFactory {
+            caps_tx,
+            handles: Arc::clone(&handles),
+            max_frames_in_flight,
+        })))
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(async move {
+                server.run().await.unwrap();
+            });
+
+            let client = tokio::task::spawn_local(async move {
+                let server_addr = local_addr_of(&ev).await;
+                let egfx = TestEgfxClient::default();
+                let (framed, connection_result) = connect_client(server_addr, |client_addr| {
+                    connector::ClientConnector::new(client_config, client_addr)
+                        .with_static_channel(DrdynvcClient::new().with_dynamic_channel(egfx))
+                })
+                .await;
+                let stage = ActiveStageBuilder {
+                    static_channels: connection_result.static_channels,
+                    user_channel_id: connection_result.user_channel_id,
+                    io_channel_id: connection_result.io_channel_id,
+                    message_channel_id: connection_result.message_channel_id,
+                    share_id: connection_result.share_id,
+                    compression_type: connection_result.compression_type,
+                    enable_server_pointer: connection_result.enable_server_pointer,
+                    pointer_software_rendering: connection_result.pointer_software_rendering,
+                }
+                .build();
+                let session = EgfxSession {
+                    stage,
+                    framed,
+                    image: DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT),
+                    caps_rx,
+                    handles,
+                };
+                let mut session = clientfn(session).await;
+                for output in session.stage.graceful_shutdown().expect("shutdown") {
+                    if let ActiveStageOutput::ResponseFrame(frame) = output {
+                        session.framed.write_all(&frame).await.expect("write frame");
+                    }
+                }
+                while let Ok(pdu) = session.framed.read_pdu().await {
+                    debug!(?pdu);
+                }
+                ev.send(ServerEvent::Quit("bye".into())).unwrap();
+            });
+
+            tokio::try_join!(server, client).expect("join");
+        })
+        .await;
+}
+
 /// Server EGFX handler that reports the client's advertised capabilities.
 struct TestGfxFactory {
     caps_tx: UnboundedSender<()>,
