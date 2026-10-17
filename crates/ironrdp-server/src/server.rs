@@ -4475,7 +4475,13 @@ impl RdpServer {
                 return Err(error);
             }
         };
-        let mut writer = SharedWriter::new(writer);
+        // Every future below queues its PDUs here and one writer future puts
+        // them on the wire in queue order. A future that holds the `this`
+        // lock so never waits for the socket, and input and frame acks read
+        // by `dispatch_pdu` get the lock while a large write is in progress.
+        let socket_writer = writer;
+        let queue = Rc::new(OutboundQueue::default());
+        let mut writer = QueuedWriter::new(Rc::clone(&queue));
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let mut auto_reconnect_writer = writer.clone();
@@ -4548,6 +4554,9 @@ impl RdpServer {
             let mut buffer = vec![0u8; 4096];
 
             loop {
+                // Back-pressure: take the next update only when what was
+                // queued before is on the wire, as when this wrote directly.
+                display_writer.wait_until_written().await;
                 match display_updates.next_update().await {
                     Ok(Some(update)) => {
                         match Self::dispatch_display_update(
@@ -4589,15 +4598,18 @@ impl RdpServer {
                     debug!("No sever events.. stopping");
                     break Ok(RunState::Disconnect);
                 }
+                // Back-pressure without the `this` lock: wait for the queued
+                // PDUs to be written, so that `dispatch_pdu` can run meanwhile.
+                event_writer.wait_until_written().await;
                 while let Ok(ev) = ev_receiver.try_recv() {
                     events.push(ev);
                 }
 
                 // D7: per-batch dispatch_events timing. The events Vec can
                 // grow up to 100+ entries; dispatch_server_events holds the
-                // `this` mutex AND the SharedWriter mutex for the full
-                // batch. Log batch size + total dispatch time so operators
-                // can see when an event batch ties up both locks.
+                // `this` mutex for the full batch (its writes only queue).
+                // Log batch size + total dispatch time so operators can see
+                // when an event batch ties up the lock.
                 let batch_size = events.len();
                 let lock_start = Instant::now();
                 let mut this = this.lock().await;
@@ -4807,14 +4819,32 @@ impl RdpServer {
             }
         };
 
-        let state = tokio::select!(
-            state = dispatch_pdu => state,
-            state = dispatch_display => state,
-            state = dispatch_events => state,
-            state = refresh_auto_reconnect_cookie => state,
-            state = send_heartbeats => state,
-            state = dispatch_udp_tunnel => state,
-        );
+        let others = async move {
+            tokio::select!(
+                state = dispatch_pdu => state,
+                state = dispatch_display => state,
+                state = dispatch_events => state,
+                state = refresh_auto_reconnect_cookie => state,
+                state = send_heartbeats => state,
+                state = dispatch_udp_tunnel => state,
+            )
+        };
+        let write_queued = queue.write_queued(socket_writer);
+        let mut others = Box::pin(others);
+        tokio::pin!(write_queued);
+        let state = tokio::select! {
+            state = &mut others => state,
+            result = &mut write_queued => {
+                result?;
+                Err(ServerError::reason("client loop", "the writer stopped"))
+            }
+        };
+        // The writer is not cancelled mid-PDU; on a normal end it writes what
+        // is queued (a Deactivate All, a disconnect reason) before returning.
+        if state.is_ok() {
+            queue.finish();
+            write_queued.await?;
+        }
 
         debug!("End of client loop: {state:?}");
         state
@@ -5830,84 +5860,133 @@ async fn send_access_denied(acceptor: &Acceptor, writer: &mut impl FramedWrite) 
     Ok(())
 }
 
-struct SharedWriter<'w, W: FramedWrite> {
-    writer: Rc<Mutex<&'w mut W>>,
-    /// Count of successful `write_all` calls across all clones. The heartbeat
-    /// loop compares it across ticks to honor 2.2.16.1's idle-only SHOULD: a
-    /// changed count means ordinary traffic already served as the liveness
-    /// signal for that interval.
-    writes: Arc<AtomicU64>,
+/// Outbound PDUs of one client loop, in the order they were queued.
+#[derive(Default)]
+struct OutboundQueue {
+    pending: RefCell<VecDeque<Vec<u8>>>,
+    /// Bytes queued and not yet fully written.
+    queued_bytes: core::cell::Cell<usize>,
+    /// Write what is queued, then stop.
+    finishing: core::cell::Cell<bool>,
+    /// The writer stopped (write error, or finished).
+    closed: core::cell::Cell<bool>,
+    pushed: tokio::sync::Notify,
+    drained: tokio::sync::Notify,
 }
 
-impl<W: FramedWrite> Clone for SharedWriter<'_, W> {
-    fn clone(&self) -> Self {
-        Self {
-            writer: Rc::clone(&self.writer),
-            writes: Arc::clone(&self.writes),
+impl OutboundQueue {
+    fn push(&self, buf: &[u8]) -> std::io::Result<()> {
+        if self.closed.get() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the connection writer stopped",
+            ));
         }
+        self.pending.borrow_mut().push_back(buf.to_vec());
+        self.queued_bytes.set(self.queued_bytes.get() + buf.len());
+        self.pushed.notify_one();
+        Ok(())
+    }
+
+    /// Waits until everything queued so far is written (or the writer stopped).
+    async fn wait_until_written(&self) {
+        loop {
+            let drained = self.drained.notified();
+            if self.queued_bytes.get() == 0 || self.closed.get() {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    /// Lets [`Self::write_queued`] return once the queue is empty.
+    fn finish(&self) {
+        self.finishing.set(true);
+        self.pushed.notify_one();
+    }
+
+    /// Writes queued PDUs in order. Runs until a write fails or, after
+    /// [`Self::finish`], the queue is empty.
+    async fn write_queued<W: FramedWrite>(&self, writer: &mut W) -> ServerResult<()> {
+        let result = loop {
+            let pushed = self.pushed.notified();
+            let next = self.pending.borrow_mut().pop_front();
+            let Some(buf) = next else {
+                if self.finishing.get() {
+                    break Ok(());
+                }
+                pushed.await;
+                continue;
+            };
+            let len = buf.len();
+            let write_start = Instant::now();
+            let res = writer.write_all(&buf).await;
+            let write_ms = u64::try_from(write_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            // A write that takes this long on a healthy LAN is TCP
+            // back-pressure (slow client or link); only the writer waits.
+            if write_ms >= 50 {
+                warn!(
+                    bytes = len,
+                    write_ms, "client write stalled, possible TCP back-pressure"
+                );
+            } else {
+                trace!(bytes = len, write_ms, "client write");
+            }
+            self.queued_bytes.set(self.queued_bytes.get() - len);
+            if let Err(e) = res {
+                break Err(ServerError::io("write_all", e));
+            }
+            if self.queued_bytes.get() == 0 {
+                self.drained.notify_waiters();
+            }
+        };
+        self.closed.set(true);
+        self.drained.notify_waiters();
+        result
     }
 }
 
-impl<W> FramedWrite for SharedWriter<'_, W>
-where
-    W: FramedWrite,
-{
+/// [`FramedWrite`] that queues PDUs on the client loop's [`OutboundQueue`]:
+/// `write_all` returns as soon as the bytes are queued.
+#[derive(Clone)]
+struct QueuedWriter {
+    queue: Rc<OutboundQueue>,
+    /// Count of PDUs queued across all clones. The heartbeat loop compares
+    /// it across ticks to honor 2.2.16.1's idle-only SHOULD: a changed count
+    /// means ordinary traffic already served as the liveness signal for that
+    /// interval.
+    writes: Arc<AtomicU64>,
+}
+
+impl FramedWrite for QueuedWriter {
     type WriteAllFut<'write>
-        = core::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + 'write>>
+        = core::future::Ready<std::io::Result<()>>
     where
         Self: 'write;
 
     fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
-        Box::pin(async move {
-            // D1: time both the lock acquisition and the actual write.
-            // Three concurrent tasks (dispatch_pdu, dispatch_display,
-            // dispatch_events) share this Rc<Mutex<W>>. When the kernel TCP
-            // send buffer fills (slow client), write_all blocks while still
-            // holding the mutex — starving the other two tasks. Logging
-            // both phases tells us whether a stall is "waiting in line for
-            // the writer" (lock-wait) or "TLS write held up by TCP back-
-            // pressure" (write-time).
-            let len = buf.len();
-            let wait_start = Instant::now();
-            let mut writer = self.writer.lock().await;
-            let wait_ms = u64::try_from(wait_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-            let write_start = Instant::now();
-            let res = writer.write_all(buf).await;
-            let write_ms = u64::try_from(write_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-            // Threshold: 50ms total budget for one write_all. Anything above
-            // is operationally interesting on a healthy LAN. Logged at WARN
-            // when stalled, DEBUG when fast (so wire-time samples are still
-            // visible during routine debugging).
-            if wait_ms + write_ms >= 50 {
-                tracing::warn!(
-                    bytes = len,
-                    lock_wait_ms = wait_ms,
-                    write_ms,
-                    "SharedWriter.write_all stalled, possible TCP back-pressure or writer-mutex contention"
-                );
-            } else {
-                tracing::debug!(bytes = len, lock_wait_ms = wait_ms, write_ms, "SharedWriter.write_all");
-            }
-            if res.is_ok() {
-                self.writes.fetch_add(1, Ordering::Relaxed);
-            }
-            res
-        })
+        let res = self.queue.push(buf);
+        if res.is_ok() {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+        }
+        core::future::ready(res)
     }
 }
 
-impl<'a, W: FramedWrite> SharedWriter<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
+impl QueuedWriter {
+    fn new(queue: Rc<OutboundQueue>) -> Self {
         Self {
-            writer: Rc::new(Mutex::new(writer)),
+            queue,
             writes: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn write_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.writes)
+    }
+
+    async fn wait_until_written(&self) {
+        self.queue.wait_until_written().await;
     }
 }
 
@@ -6762,6 +6841,29 @@ mod cliprdr_error_tests {
         assert!(!writer.0.is_empty(), "a Create Request");
         assert!(!conn.egfx_on_udp);
         assert!(server.gfx_handle.is_some());
+    }
+
+    /// Queued PDUs reach the socket in queue order, and a finished queue is
+    /// written out before the writer returns.
+    #[tokio::test]
+    async fn queued_writes_keep_their_order() {
+        let queue = Rc::new(OutboundQueue::default());
+        let mut a = QueuedWriter::new(Rc::clone(&queue));
+        let mut b = a.clone();
+        a.write_all(b"one").await.expect("queue");
+        b.write_all(b"two").await.expect("queue");
+        a.write_all(b"three").await.expect("queue");
+        assert_eq!(a.write_counter().load(Ordering::Relaxed), 3);
+
+        let mut socket = CapturingWriter::default();
+        queue.finish();
+        queue.write_queued(&mut socket).await.expect("write");
+        assert_eq!(socket.0, b"onetwothree");
+        // Written, and the writer stopped: nothing more is accepted.
+        tokio::time::timeout(Duration::from_millis(100), a.wait_until_written())
+            .await
+            .expect("nothing left to write");
+        assert!(a.write_all(b"late").await.is_err());
     }
 
     /// A clipboard message the channel refuses keeps the session alive.
