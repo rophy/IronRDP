@@ -1783,6 +1783,32 @@ async fn egfx_reopens_after_the_client_closed_it() {
     .await;
 }
 
+/// A client that declined the EGFX Create Request can get the channel with
+/// a reopen.
+#[tokio::test]
+async fn egfx_reopens_after_the_client_declined_it() {
+    let client_config = connector::Config {
+        support_dyn_vc_gfx_protocol: true,
+        ..default_client_config()
+    };
+    egfx_session(client_config, 3, true, |mut session| async move {
+        session.decline_egfx.store(1, Ordering::SeqCst);
+        session.pump_for(Duration::from_millis(300)).await;
+        assert_eq!(session.decline_egfx.load(Ordering::SeqCst), 0, "the client declined");
+        assert_eq!(*session.channel_id.lock().unwrap(), None);
+
+        session
+            .ev
+            .send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::Reopen))
+            .unwrap();
+        session.wait_for_egfx().await;
+        assert!(session.channel_id.lock().unwrap().is_some(), "EGFX channel open");
+        assert_eq!(session.handles.lock().unwrap().len(), 2, "a new pipeline");
+        session
+    })
+    .await;
+}
+
 /// EGFX factory that keeps the pipeline of every channel it builds.
 struct HandleGfxFactory {
     caps_tx: UnboundedSender<()>,
@@ -1811,8 +1837,9 @@ impl GfxServerFactory for HandleGfxFactory {
 }
 
 /// Accepts every EGFX channel the server creates (a pre-registered client
-/// channel is accepted once only). All of them share the test's state.
-struct EgfxListener(TestEgfxClient);
+/// channel is accepted once only), except that it declines as many as
+/// `decline` says. All of them share the test's state.
+struct EgfxListener(TestEgfxClient, Arc<AtomicUsize>);
 
 impl ironrdp_dvc::DvcChannelListener for EgfxListener {
     fn channel_name(&self) -> &str {
@@ -1820,6 +1847,13 @@ impl ironrdp_dvc::DvcChannelListener for EgfxListener {
     }
 
     fn create(&mut self, _channel_id: u32) -> Option<Box<dyn DvcClientProcessor>> {
+        if self
+            .1
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return None;
+        }
         Some(Box::new(TestEgfxClient {
             channel_id: Arc::clone(&self.0.channel_id),
             received: Arc::clone(&self.0.received),
@@ -1836,6 +1870,8 @@ struct EgfxSession {
     caps_rx: UnboundedReceiver<()>,
     /// Channel id of the client's EGFX channel; set again on each open.
     channel_id: Arc<StdMutex<Option<u32>>>,
+    /// The client declines this many EGFX Create Requests (NO_LISTENER).
+    decline_egfx: Arc<AtomicUsize>,
     /// Every pipeline the server built, oldest first.
     handles: Arc<StdMutex<Vec<ironrdp_server::GfxServerHandle>>>,
 }
@@ -1951,9 +1987,11 @@ async fn egfx_session<F, Fut>(
                 let server_addr = local_addr_of(&ev).await;
                 let egfx = TestEgfxClient::default();
                 let channel_id = Arc::clone(&egfx.channel_id);
+                let decline_egfx = Arc::new(AtomicUsize::new(0));
+                let listener = EgfxListener(egfx, Arc::clone(&decline_egfx));
                 let (framed, connection_result) = connect_client(server_addr, |client_addr| {
                     connector::ClientConnector::new(client_config, client_addr)
-                        .with_static_channel(DrdynvcClient::new().with_listener(EgfxListener(egfx)))
+                        .with_static_channel(DrdynvcClient::new().with_listener(listener))
                 })
                 .await;
                 let stage = ActiveStageBuilder {
@@ -1974,6 +2012,7 @@ async fn egfx_session<F, Fut>(
                     ev: ev.clone(),
                     caps_rx,
                     channel_id,
+                    decline_egfx,
                     handles,
                 };
                 let mut session = clientfn(session).await;

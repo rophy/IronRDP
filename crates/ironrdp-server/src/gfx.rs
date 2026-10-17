@@ -107,7 +107,8 @@ pub enum EgfxServerMessage {
     /// Pre-encoded DVC messages from `GraphicsPipelineServer::drain_output()`.
     SendMessages { messages: Vec<SvcMessage> },
     /// Open the EGFX channel again, with a new pipeline from the factory,
-    /// after the client closed it. Nothing happens while the channel exists.
+    /// after the client closed or declined it. Nothing happens while the
+    /// channel is open or being created.
     Reopen,
 }
 

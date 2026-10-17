@@ -192,6 +192,15 @@ impl DrdynvcServer {
             .is_some_and(|c| c.state == ChannelState::Opened)
     }
 
+    /// Returns `true` if the client answered the Create Request of the DVC
+    /// channel with the given ID with a failure status: it declined the
+    /// channel, which stays known (by type too) but never opens.
+    pub fn is_channel_declined(&self, channel_id: u32) -> bool {
+        self.dynamic_channels
+            .get(channel_id)
+            .is_some_and(|c| matches!(c.state, ChannelState::CreationFailed(_)))
+    }
+
     /// Registers a dynamic channel with the server.
     ///
     /// # Panics
@@ -254,7 +263,9 @@ impl DrdynvcServer {
 
     /// Creates a new DVC that [`Self::get_channel_id_by_type`] finds, like a
     /// channel added with [`Self::with_dynamic_channel`]. Use it to open a
-    /// channel again after the client closed it. Returns the Create Request PDU.
+    /// channel again after the client closed or declined it
+    /// ([`Self::is_channel_declined`]); a declined channel of the same type is
+    /// removed. Returns the Create Request PDU.
     ///
     /// # Panics
     ///
@@ -263,6 +274,11 @@ impl DrdynvcServer {
     where
         T: DvcServerProcessor + 'static,
     {
+        if let Some(old) = self.get_channel_id_by_type::<T>()
+            && self.is_channel_declined(old)
+        {
+            self.remove_by_channel_id(old);
+        }
         let channel_id = self.dynamic_channels.reserve_channel();
         let msg = self.create_channel_with_id(channel, channel_id)?;
         self.type_id_to_channel_id.insert(TypeId::of::<T>(), channel_id);
@@ -596,6 +612,33 @@ mod tests {
         server.create_registered_channel(TestDvc).unwrap();
         let second = server.get_channel_id_by_type::<TestDvc>().expect("registered again");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_declined_channel_is_replaced_by_a_registered_channel() {
+        let mut server = DrdynvcServer::new().with_dynamic_channel(TestDvc);
+        let caps = ironrdp_core::encode_vec(&DrdynvcClientPdu::Capabilities(
+            crate::pdu::CapabilitiesResponsePdu::new(CapsVersion::V2),
+        ))
+        .unwrap();
+        server.process(&caps).unwrap();
+        let first = server.get_channel_id_by_type::<TestDvc>().expect("registered");
+        assert!(!server.is_channel_declined(first));
+
+        let declined = ironrdp_core::encode_vec(&DrdynvcClientPdu::Create(crate::pdu::CreateResponsePdu::new(
+            first,
+            CreationStatus::NO_LISTENER,
+        )))
+        .unwrap();
+        server.process(&declined).unwrap();
+        assert!(server.is_channel_declined(first));
+        assert_eq!(server.get_channel_id_by_type::<TestDvc>(), Some(first));
+
+        server.create_registered_channel(TestDvc).unwrap();
+        let second = server.get_channel_id_by_type::<TestDvc>().expect("registered again");
+        assert_ne!(first, second);
+        assert!(!server.is_channel_declined(first), "the declined channel is gone");
+        assert!(!server.is_channel_declined(second));
     }
 
     #[test]

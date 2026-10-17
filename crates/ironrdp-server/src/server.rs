@@ -4130,7 +4130,9 @@ impl RdpServer {
             warn!("No DRDYNVC channel, EGFX reopen dropped");
             return Ok(());
         };
-        if crate::gfx::egfx_channel_id(drdynvc).is_some() {
+        if let Some(channel_id) = crate::gfx::egfx_channel_id(drdynvc)
+            && !drdynvc.is_channel_declined(channel_id)
+        {
             debug!("EGFX channel exists, no reopen");
             return Ok(());
         }
