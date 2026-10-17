@@ -4142,6 +4142,13 @@ impl RdpServer {
             .map_err_kind("create EGFX channel", ServerErrorKind::Pdu)?;
         self.apply_core_frame_ack_limit(&handle, conn.core_frame_ack_limit)?;
         self.gfx_handle = Some(handle);
+        // Soft-Sync moves channels onto the tunnel once per connection
+        // (`request_reliable_udp`), and only the old EGFX channel was moved,
+        // so the new one stays on TCP and nothing is left on the tunnel.
+        if conn.egfx_on_udp {
+            debug!("EGFX was on the UDP transport; the new channel stays on TCP");
+            conn.egfx_on_udp = false;
+        }
         info!("Opening the EGFX channel again");
         let drdynvc_channel_id = conn
             .get_channel_id_by_type::<dvc::DrdynvcServer>()
@@ -6709,6 +6716,52 @@ mod cliprdr_error_tests {
             self.0.extend_from_slice(buf);
             core::future::ready(Ok(()))
         }
+    }
+
+    #[cfg(feature = "egfx")]
+    struct LegacyGfxFactory;
+
+    #[cfg(feature = "egfx")]
+    impl ServerEventSender for LegacyGfxFactory {
+        fn set_sender(&mut self, _sender: mpsc::UnboundedSender<ServerEvent>) {}
+    }
+
+    #[cfg(feature = "egfx")]
+    impl GfxServerFactory for LegacyGfxFactory {
+        fn build_gfx_handler(&self) -> Box<dyn ironrdp_egfx::server::GraphicsPipelineHandler> {
+            struct Handler;
+            impl ironrdp_egfx::server::GraphicsPipelineHandler for Handler {
+                fn capabilities_advertise(&mut self, _pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {}
+                fn on_ready(&mut self, _negotiated: &ironrdp_egfx::pdu::CapabilitySet) {}
+            }
+            Box::new(Handler)
+        }
+    }
+
+    /// A reopened EGFX channel stays on TCP (Soft-Sync is once per
+    /// connection), so the connection no longer counts EGFX as on UDP.
+    #[cfg(feature = "egfx")]
+    #[tokio::test]
+    async fn a_reopened_egfx_channel_is_not_on_udp() {
+        let mut server = RdpServer::builder()
+            .with_addr((Ipv4Addr::LOCALHOST, 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_gfx_factory(Some(Box::new(LegacyGfxFactory)))
+            .build();
+        let mut conn = ConnectionState {
+            egfx_on_udp: true,
+            ..ConnectionState::default()
+        };
+        conn.static_channels.insert(dvc::DrdynvcServer::new());
+        conn.static_channels
+            .attach_channel_id(TypeId::of::<dvc::DrdynvcServer>(), 1005);
+        let mut writer = CapturingWriter::default();
+        server.reopen_egfx(&mut conn, &mut writer, 1002).await.expect("reopen");
+        assert!(!writer.0.is_empty(), "a Create Request");
+        assert!(!conn.egfx_on_udp);
+        assert!(server.gfx_handle.is_some());
     }
 
     /// A clipboard message the channel refuses keeps the session alive.

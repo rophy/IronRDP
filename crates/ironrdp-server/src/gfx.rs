@@ -109,6 +109,9 @@ pub enum EgfxServerMessage {
     /// Open the EGFX channel again, with a new pipeline from the factory,
     /// after the client closed or declined it. Nothing happens while the
     /// channel is open or being created.
+    ///
+    /// The new channel uses TCP: Soft-Sync (MS-RDPEDYC 3.3.5.3) moves channels
+    /// to the UDP transport once per connection.
     Reopen,
 }
 
