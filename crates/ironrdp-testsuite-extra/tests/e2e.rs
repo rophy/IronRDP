@@ -1709,6 +1709,41 @@ async fn core_frame_ack_capability_does_not_limit_the_egfx_window() {
     .await;
 }
 
+/// After the client closed EGFX, [`ironrdp_server::EgfxServerMessage::Reopen`]
+/// opens it again with a new pipeline from the factory. While the channel is
+/// open, a reopen does nothing.
+#[tokio::test]
+async fn egfx_reopens_after_the_client_closed_it() {
+    let client_config = connector::Config {
+        support_dyn_vc_gfx_protocol: true,
+        ..default_client_config()
+    };
+    egfx_session(client_config, 3, |mut session| async move {
+        session.wait_for_egfx().await;
+        let first = session.channel_id.lock().unwrap().expect("EGFX channel open");
+
+        session
+            .ev
+            .send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::Reopen))
+            .unwrap();
+        session.pump_for(Duration::from_millis(200)).await;
+        assert_eq!(session.handles.lock().unwrap().len(), 1, "no reopen while open");
+
+        session.close_egfx().await;
+        session.pump_for(Duration::from_millis(200)).await;
+        session
+            .ev
+            .send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::Reopen))
+            .unwrap();
+        session.wait_for_egfx().await;
+        let second = session.channel_id.lock().unwrap().expect("EGFX channel open again");
+        assert_ne!(first, second, "a new channel");
+        assert_eq!(session.handles.lock().unwrap().len(), 2, "a new pipeline");
+        session
+    })
+    .await;
+}
+
 /// EGFX factory that keeps the pipeline of every channel it builds.
 struct HandleGfxFactory {
     caps_tx: UnboundedSender<()>,
@@ -1736,12 +1771,32 @@ impl GfxServerFactory for HandleGfxFactory {
     }
 }
 
+/// Accepts every EGFX channel the server creates (a pre-registered client
+/// channel is accepted once only). All of them share the test's state.
+struct EgfxListener(TestEgfxClient);
+
+impl ironrdp_dvc::DvcChannelListener for EgfxListener {
+    fn channel_name(&self) -> &str {
+        "Microsoft::Windows::RDS::Graphics"
+    }
+
+    fn create(&mut self, _channel_id: u32) -> Option<Box<dyn DvcClientProcessor>> {
+        Some(Box::new(TestEgfxClient {
+            channel_id: Arc::clone(&self.0.channel_id),
+            received: Arc::clone(&self.0.received),
+        }))
+    }
+}
+
 /// Client side of a connection with an EGFX channel (TCP only).
 struct EgfxSession {
     stage: ActiveStage,
     framed: Framed<TokioStream<TlsStream<TcpStream>>>,
     image: DecodedImage,
+    ev: UnboundedSender<ServerEvent>,
     caps_rx: UnboundedReceiver<()>,
+    /// Channel id of the client's EGFX channel; set again on each open.
+    channel_id: Arc<StdMutex<Option<u32>>>,
     /// Every pipeline the server built, oldest first.
     handles: Arc<StdMutex<Vec<ironrdp_server::GfxServerHandle>>>,
 }
@@ -1766,6 +1821,28 @@ impl EgfxSession {
         })
         .await
         .expect("the EGFX channel opened");
+    }
+
+    /// Process server PDUs for `duration`.
+    async fn pump_for(&mut self, duration: Duration) {
+        let deadline = tokio::time::Instant::now() + duration;
+        while let Ok(pdu) = tokio::time::timeout_at(deadline, self.framed.read_pdu()).await {
+            let (action, frame) = pdu.expect("read PDU");
+            self.handle_pdu(action, &frame).await;
+        }
+    }
+
+    /// Close the EGFX channel from the client side.
+    async fn close_egfx(&mut self) {
+        let channel_id = self.channel_id.lock().unwrap().expect("EGFX channel open");
+        let close = self
+            .stage
+            .get_svc_processor_mut::<DrdynvcClient>()
+            .expect("DRDYNVC")
+            .close_channel(channel_id)
+            .expect("EGFX channel known to the client");
+        let frame = self.stage.encode_dvc_messages(vec![close]).expect("encode Close");
+        self.framed.write_all(&frame).await.expect("write Close");
     }
 
     async fn handle_pdu(&mut self, action: pdu::Action, frame: &[u8]) {
@@ -1829,9 +1906,10 @@ where
             let client = tokio::task::spawn_local(async move {
                 let server_addr = local_addr_of(&ev).await;
                 let egfx = TestEgfxClient::default();
+                let channel_id = Arc::clone(&egfx.channel_id);
                 let (framed, connection_result) = connect_client(server_addr, |client_addr| {
                     connector::ClientConnector::new(client_config, client_addr)
-                        .with_static_channel(DrdynvcClient::new().with_dynamic_channel(egfx))
+                        .with_static_channel(DrdynvcClient::new().with_listener(EgfxListener(egfx)))
                 })
                 .await;
                 let stage = ActiveStageBuilder {
@@ -1849,7 +1927,9 @@ where
                     stage,
                     framed,
                     image: DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT),
+                    ev: ev.clone(),
                     caps_rx,
+                    channel_id,
                     handles,
                 };
                 let mut session = clientfn(session).await;

@@ -3936,6 +3936,9 @@ impl RdpServer {
                         self.dispatch_egfx_messages(conn, messages, writer, user_channel_id, udp_transport)
                             .await?;
                     }
+                    EgfxServerMessage::Reopen => {
+                        self.reopen_egfx(conn, writer, user_channel_id).await?;
+                    }
                 },
                 ServerEvent::AutoDetectRttRequest => {
                     // Auto-detect requests ride the MCS message channel
@@ -3981,6 +3984,46 @@ impl RdpServer {
         }
 
         Ok(RunState::Continue)
+    }
+
+    /// Opens the EGFX channel again after the client closed it
+    /// ([`EgfxServerMessage::Reopen`]). The factory builds a new pipeline and
+    /// [`Self::gfx_handle`] points to it from then on.
+    #[cfg(feature = "egfx")]
+    async fn reopen_egfx(
+        &mut self,
+        conn: &mut ConnectionState,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+    ) -> ServerResult<()> {
+        let Some(gfx_factory) = self.gfx_factory.as_deref() else {
+            warn!("EGFX reopen requested without a graphics factory");
+            return Ok(());
+        };
+        let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
+            warn!("No DRDYNVC channel, EGFX reopen dropped");
+            return Ok(());
+        };
+        if crate::gfx::egfx_channel_id(drdynvc).is_some() {
+            debug!("EGFX channel exists, no reopen");
+            return Ok(());
+        }
+        let (processor, handle) = crate::gfx::build_server_and_handle(gfx_factory);
+        let create = drdynvc
+            .create_registered_channel(processor)
+            .map_err_kind("create EGFX channel", ServerErrorKind::Pdu)?;
+        self.gfx_handle = Some(handle);
+        info!("Opening the EGFX channel again");
+        let drdynvc_channel_id = conn
+            .get_channel_id_by_type::<dvc::DrdynvcServer>()
+            .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
+        let data = server_encode_svc_messages(vec![create], drdynvc_channel_id, user_channel_id)
+            .map_err(ServerError::encode)?;
+        writer
+            .write_all(&data)
+            .await
+            .map_err(|e| ServerError::io("write_all", e))?;
+        Ok(())
     }
 
     /// Routes EGFX graphics data over the sideband UDP transport when one is

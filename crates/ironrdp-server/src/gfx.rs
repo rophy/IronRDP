@@ -106,6 +106,9 @@ impl DvcServerProcessor for GfxDvcBridge {}
 pub enum EgfxServerMessage {
     /// Pre-encoded DVC messages from `GraphicsPipelineServer::drain_output()`.
     SendMessages { messages: Vec<SvcMessage> },
+    /// Open the EGFX channel again, with a new pipeline from the factory,
+    /// after the client closed it. Nothing happens while the channel exists.
+    Reopen,
 }
 
 impl core::fmt::Display for EgfxServerMessage {
@@ -114,6 +117,7 @@ impl core::fmt::Display for EgfxServerMessage {
             Self::SendMessages { messages } => {
                 write!(f, "SendMessages(count={})", messages.len())
             }
+            Self::Reopen => f.write_str("Reopen"),
         }
     }
 }

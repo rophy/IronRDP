@@ -252,6 +252,23 @@ impl DrdynvcServer {
         self.create_channel_with_id(channel, channel_id)
     }
 
+    /// Creates a new DVC that [`Self::get_channel_id_by_type`] finds, like a
+    /// channel added with [`Self::with_dynamic_channel`]. Use it to open a
+    /// channel again after the client closed it. Returns the Create Request PDU.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of registered dynamic channels reaches `u32::MAX`.
+    pub fn create_registered_channel<T>(&mut self, channel: T) -> PduResult<SvcMessage>
+    where
+        T: DvcServerProcessor + 'static,
+    {
+        let channel_id = self.dynamic_channels.reserve_channel();
+        let msg = self.create_channel_with_id(channel, channel_id)?;
+        self.type_id_to_channel_id.insert(TypeId::of::<T>(), channel_id);
+        Ok(msg)
+    }
+
     /// Creates a new DVC using a processor built with its assigned channel ID.
     ///
     /// The next channel ID is reserved and passed to `build`, allowing the
@@ -565,6 +582,21 @@ mod tests {
     }
 
     impl DvcServerProcessor for TestDvc {}
+
+    #[test]
+    fn a_registered_channel_is_found_by_type_again_after_a_close() {
+        let mut server = DrdynvcServer::new().with_dynamic_channel(TestDvc);
+        let first = server.get_channel_id_by_type::<TestDvc>().expect("registered");
+
+        // The client closes the channel: the type no longer has a channel.
+        let close = ironrdp_core::encode_vec(&DrdynvcClientPdu::Close(ClosePdu::new(first))).unwrap();
+        server.process(&close).unwrap();
+        assert_eq!(server.get_channel_id_by_type::<TestDvc>(), None);
+
+        server.create_registered_channel(TestDvc).unwrap();
+        let second = server.get_channel_id_by_type::<TestDvc>().expect("registered again");
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn soft_sync_rejects_tunnel_data_until_the_client_responds() {
