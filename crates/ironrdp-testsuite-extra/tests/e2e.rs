@@ -2565,6 +2565,72 @@ async fn connect_client(
     (upgraded_framed, connection_result)
 }
 
+/// The server hands the client's pointer capabilities to the connection handler.
+#[tokio::test]
+async fn connection_info_has_the_client_pointer_capabilities() {
+    struct InfoRecorder(Arc<StdMutex<Option<server::ConnectionInfo>>>);
+
+    impl server::ConnectionHandler for InfoRecorder {
+        fn on_connection_info(&mut self, info: &server::ConnectionInfo) {
+            *self.0.lock().unwrap() = Some(info.clone());
+        }
+    }
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+    let info = Arc::new(StdMutex::new(None));
+    let (_display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
+        })
+        .with_connection_handler(Some(Box::new(InfoRecorder(Arc::clone(&info)))))
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+    let recorded = Arc::clone(&info);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+            let server_addr = local_addr_of(&ev).await;
+            let (client, _) = connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(default_client_config(), client_addr)
+            })
+            .await;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while recorded.lock().unwrap().is_none() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(client);
+            server_task.abort();
+        })
+        .await;
+
+    let info = info.lock().unwrap().clone().expect("on_connection_info was called");
+    // The IronRDP client advertises 32 slots for both caches, and both large pointer sizes.
+    assert_eq!(info.pointer_cache_size, 32);
+    assert_eq!(info.color_pointer_cache_size, 32);
+    assert_eq!(
+        info.large_pointer_flags,
+        pdu::rdp::capability_sets::LargePointerSupportFlags::UP_TO_96X96_PIXELS
+            | pdu::rdp::capability_sets::LargePointerSupportFlags::UP_TO_384X384_PIXELS
+    );
+}
+
 /// Counts how often each `ConnectionHandler` hook reached the handler.
 /// `on_accept` fires before a connection is served, `on_connection_info`
 /// mid-connection, `on_disconnected` after it ends.

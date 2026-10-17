@@ -146,6 +146,15 @@ pub struct ConnectionInfo {
     pub auto_reconnect: bool,
     /// See [`ironrdp_acceptor::AcceptorResult::client_info_flags`].
     pub client_info_flags: ClientInfoFlags,
+    /// `pointerCacheSize` of the client's Pointer Capability Set (MS-RDPBCGR
+    /// 2.2.7.1.5): cache slots for New Pointer Updates (cache indexes
+    /// `0..pointer_cache_size`). 0 when the client sent none.
+    pub pointer_cache_size: u16,
+    /// `colorPointerCacheSize` of the same capability set (Color Pointer Updates).
+    pub color_pointer_cache_size: u16,
+    /// Flags of the client's Large Pointer Capability Set (MS-RDPBCGR 2.2.7.2.7);
+    /// empty when the client sent none, so pointer shapes are limited to 32x32.
+    pub large_pointer_flags: LargePointerSupportFlags,
 }
 
 impl ConnectionInfo {
@@ -160,8 +169,42 @@ impl ConnectionInfo {
             ime_file_name,
             auto_reconnect: false,
             client_info_flags: ClientInfoFlags::empty(),
+            pointer_cache_size: 0,
+            color_pointer_cache_size: 0,
+            large_pointer_flags: LargePointerSupportFlags::empty(),
         }
     }
+
+    /// Sets the pointer capabilities, for tests of downstream handlers.
+    #[must_use]
+    pub fn with_pointer_caps(
+        mut self,
+        pointer_cache_size: u16,
+        color_pointer_cache_size: u16,
+        large_pointer_flags: LargePointerSupportFlags,
+    ) -> Self {
+        self.pointer_cache_size = pointer_cache_size;
+        self.color_pointer_cache_size = color_pointer_cache_size;
+        self.large_pointer_flags = large_pointer_flags;
+        self
+    }
+}
+
+/// Pointer cache sizes (pointer, color pointer) and large pointer flags from
+/// the client's capability sets; zeros and no flags for sets it did not send.
+fn client_pointer_caps(capabilities: &[CapabilitySet]) -> (u16, u16, LargePointerSupportFlags) {
+    let mut caps = (0, 0, LargePointerSupportFlags::empty());
+    for capability in capabilities {
+        match capability {
+            CapabilitySet::Pointer(p) => {
+                caps.0 = p.pointer_cache_size;
+                caps.1 = p.color_pointer_cache_size;
+            }
+            CapabilitySet::LargePointer(lp) => caps.2 = lp.flags,
+            _ => {}
+        }
+    }
+    caps
 }
 
 /// Hooks for connection lifecycle events.
@@ -4730,6 +4773,8 @@ impl RdpServer {
         }
 
         if !result.reactivation {
+            let (pointer_cache_size, color_pointer_cache_size, large_pointer_flags) =
+                client_pointer_caps(&result.capabilities);
             with_connection_handler(self.connection_handler.as_ref(), |h| {
                 h.on_connection_info(&ConnectionInfo {
                     keyboard_layout: result.keyboard_layout,
@@ -4737,6 +4782,9 @@ impl RdpServer {
                     ime_file_name: result.ime_file_name.clone(),
                     auto_reconnect: is_auto_reconnect,
                     client_info_flags: result.client_info_flags,
+                    pointer_cache_size,
+                    color_pointer_cache_size,
+                    large_pointer_flags,
                 });
             });
         }
@@ -6587,6 +6635,31 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
+    }
+}
+
+#[cfg(test)]
+mod pointer_caps_tests {
+    use ironrdp_pdu::rdp::capability_sets::{LargePointer, Pointer};
+
+    use super::*;
+
+    #[test]
+    fn pointer_caps_come_from_the_capability_sets() {
+        assert_eq!(client_pointer_caps(&[]), (0, 0, LargePointerSupportFlags::empty()));
+        let caps = [
+            CapabilitySet::Pointer(Pointer {
+                color_pointer_cache_size: 25,
+                pointer_cache_size: 21,
+            }),
+            CapabilitySet::LargePointer(LargePointer {
+                flags: LargePointerSupportFlags::UP_TO_96X96_PIXELS,
+            }),
+        ];
+        assert_eq!(
+            client_pointer_caps(&caps),
+            (21, 25, LargePointerSupportFlags::UP_TO_96X96_PIXELS)
+        );
     }
 }
 
