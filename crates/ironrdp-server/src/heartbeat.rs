@@ -125,8 +125,11 @@ mod tests {
         assert!(next.is_err(), "two requests before a take make one PDU");
     }
 
+    /// The client loop drops a stale request with `take`. That the loop does
+    /// so is tested end to end (testsuite-extra
+    /// `a_heartbeat_request_from_before_the_client_loop_is_not_sent`).
     #[tokio::test]
-    async fn a_dropped_request_is_not_sent_later() {
+    async fn a_taken_request_is_not_returned_again() {
         let handle = HeartbeatHandle::default();
         handle.send(CONFIG);
         assert_eq!(handle.take(), Some(CONFIG));

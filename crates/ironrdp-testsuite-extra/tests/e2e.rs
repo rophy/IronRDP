@@ -3113,11 +3113,20 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for AdvertiseHeartb
     }
 }
 
+/// When [`on_demand_heartbeat`] asks the server for a heartbeat.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAsk {
+    /// After the client connected, again and again until one arrives.
+    UntilOneArrives,
+    /// One time, before the client connects.
+    OnceBeforeConnect,
+}
+
 /// Connects a client, asks the server through its
-/// [`server::heartbeat::HeartbeatHandle`] for heartbeats until one arrives (or
-/// 1 s passes), and returns `ConnectionInfo::client_supports_heartbeat` and
-/// the Heartbeat PDU the client got on the message channel.
-async fn on_demand_heartbeat(advertise: bool) -> (bool, Option<pdu::rdp::heartbeat::HeartbeatPdu>) {
+/// [`server::heartbeat::HeartbeatHandle`] for heartbeats as `ask` says, waits
+/// up to 1 s for one, and returns `ConnectionInfo::client_supports_heartbeat`
+/// and the Heartbeat PDU the client got on the message channel.
+async fn on_demand_heartbeat(advertise: bool, ask: HeartbeatAsk) -> (bool, Option<pdu::rdp::heartbeat::HeartbeatPdu>) {
     struct InfoRecorder(Arc<StdMutex<Option<server::ConnectionInfo>>>);
 
     impl server::ConnectionHandler for InfoRecorder {
@@ -3154,6 +3163,9 @@ async fn on_demand_heartbeat(advertise: bool) -> (bool, Option<pdu::rdp::heartbe
         domain: None,
     }));
     let heartbeats = server.heartbeat_handle();
+    if ask == HeartbeatAsk::OnceBeforeConnect {
+        heartbeats.send(CONFIG);
+    }
     let ev = server.event_sender().clone();
     let patched = Arc::new(AtomicBool::new(false));
     let patched_by_client = Arc::clone(&patched);
@@ -3209,7 +3221,9 @@ async fn on_demand_heartbeat(advertise: bool) -> (bool, Option<pdu::rdp::heartbe
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
                 let mut received = None;
                 while received.is_none() {
-                    heartbeats.send(CONFIG);
+                    if ask == HeartbeatAsk::UntilOneArrives {
+                        heartbeats.send(CONFIG);
+                    }
                     let Ok(pdu) = tokio::time::timeout_at(
                         deadline.min(tokio::time::Instant::now() + Duration::from_millis(50)),
                         framed.read_pdu(),
@@ -3260,15 +3274,24 @@ async fn on_demand_heartbeat(advertise: bool) -> (bool, Option<pdu::rdp::heartbe
 /// message channel.
 #[tokio::test]
 async fn on_demand_heartbeat_reaches_a_client_that_advertises_it() {
-    let (supports, received) = on_demand_heartbeat(true).await;
+    let (supports, received) = on_demand_heartbeat(true, HeartbeatAsk::UntilOneArrives).await;
     assert!(supports);
     assert!(received.is_some(), "a Heartbeat PDU");
+}
+
+/// A request made while no client loop runs is dropped when the next client
+/// loop starts: the next client does not get a stale heartbeat.
+#[tokio::test]
+async fn a_heartbeat_request_from_before_the_client_loop_is_not_sent() {
+    let (supports, received) = on_demand_heartbeat(true, HeartbeatAsk::OnceBeforeConnect).await;
+    assert!(supports);
+    assert!(received.is_none(), "{received:?}");
 }
 
 /// A client that does not advertise heartbeats gets none.
 #[tokio::test]
 async fn on_demand_heartbeat_skips_a_client_without_it() {
-    let (supports, received) = on_demand_heartbeat(false).await;
+    let (supports, received) = on_demand_heartbeat(false, HeartbeatAsk::UntilOneArrives).await;
     assert!(!supports);
     assert!(received.is_none());
 }
