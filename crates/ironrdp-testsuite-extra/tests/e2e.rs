@@ -1678,35 +1678,74 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
         .await;
 }
 
-/// The core Frame Acknowledge capability (MS-RDPRFX 2.2.1.3) limits surface
-/// commands, not EGFX: the EGFX frame window stays at the server's value when
-/// the client advertises a smaller core value.
-#[tokio::test]
-async fn core_frame_ack_capability_does_not_limit_the_egfx_window() {
-    let client_config = connector::Config {
+/// A client config that advertises the core Frame Acknowledge capability
+/// (maxUnacknowledgedFrameCount 20, MS-RDPRFX 2.2.1.3): it comes with a bitmap
+/// codec.
+fn egfx_client_with_core_frame_ack() -> connector::Config {
+    connector::Config {
         support_dyn_vc_gfx_protocol: true,
-        // With a bitmap codec the client advertises Frame Acknowledge
-        // (maxUnacknowledgedFrameCount 20).
         bitmap: Some(connector::BitmapConfig {
             lossy_compression: true,
             color_depth: 32,
             codecs: pdu::rdp::capability_sets::client_codecs_capabilities(&["remotefx:on"]).expect("codecs"),
         }),
         ..default_client_config()
-    };
-    egfx_session(client_config, 30, |mut session| async move {
-        session.wait_for_egfx().await;
-        let handle = session
-            .handles
-            .lock()
-            .unwrap()
-            .last()
-            .cloned()
-            .expect("an EGFX pipeline");
-        assert_eq!(handle.lock().unwrap().max_frames_in_flight(), 30);
-        session
-    })
+    }
+}
+
+/// The EGFX window of the first pipeline, and of the one a reopen builds after
+/// the client closed the channel.
+async fn egfx_windows_before_and_after_reopen(egfx_core_frame_ack_limit: bool) -> (u32, u32) {
+    let windows = Arc::new(StdMutex::new((0, 0)));
+    let out = Arc::clone(&windows);
+    egfx_session(
+        egfx_client_with_core_frame_ack(),
+        30,
+        egfx_core_frame_ack_limit,
+        |mut session| async move {
+            let last_window = |session: &EgfxSession| {
+                let handle = session
+                    .handles
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .cloned()
+                    .expect("an EGFX pipeline");
+                handle.lock().unwrap().max_frames_in_flight()
+            };
+            session.wait_for_egfx().await;
+            out.lock().unwrap().0 = last_window(&session);
+            // Take the server's reply to the capabilities before closing.
+            session.pump_for(Duration::from_millis(200)).await;
+            session.close_egfx().await;
+            session.pump_for(Duration::from_millis(200)).await;
+            session
+                .ev
+                .send(ServerEvent::Egfx(ironrdp_server::EgfxServerMessage::Reopen))
+                .unwrap();
+            session.wait_for_egfx().await;
+            assert_eq!(session.handles.lock().unwrap().len(), 2, "a new pipeline");
+            out.lock().unwrap().1 = last_window(&session);
+            session
+        },
+    )
     .await;
+    *windows.lock().unwrap()
+}
+
+/// By default the client's core Frame Acknowledge value caps the EGFX window,
+/// on the first pipeline and on a reopened one.
+#[tokio::test]
+async fn core_frame_ack_capability_caps_the_egfx_window_by_default() {
+    assert_eq!(egfx_windows_before_and_after_reopen(true).await, (20, 20));
+}
+
+/// With [`RdpServer::set_egfx_core_frame_ack_limit`] off, the core value
+/// (which MS-RDPRFX 2.2.1.3 gives for surface commands) does not limit EGFX:
+/// the window stays at the pipeline's value.
+#[tokio::test]
+async fn core_frame_ack_capability_does_not_limit_the_egfx_window_when_off() {
+    assert_eq!(egfx_windows_before_and_after_reopen(false).await, (30, 30));
 }
 
 /// After the client closed EGFX, [`ironrdp_server::EgfxServerMessage::Reopen`]
@@ -1718,7 +1757,7 @@ async fn egfx_reopens_after_the_client_closed_it() {
         support_dyn_vc_gfx_protocol: true,
         ..default_client_config()
     };
-    egfx_session(client_config, 3, |mut session| async move {
+    egfx_session(client_config, 3, true, |mut session| async move {
         session.wait_for_egfx().await;
         let first = session.channel_id.lock().unwrap().expect("EGFX channel open");
 
@@ -1858,8 +1897,12 @@ impl EgfxSession {
     }
 }
 
-async fn egfx_session<F, Fut>(client_config: connector::Config, max_frames_in_flight: u32, clientfn: F)
-where
+async fn egfx_session<F, Fut>(
+    client_config: connector::Config,
+    max_frames_in_flight: u32,
+    egfx_core_frame_ack_limit: bool,
+    clientfn: F,
+) where
     F: FnOnce(EgfxSession) -> Fut + 'static,
     Fut: Future<Output = EgfxSession>,
 {
@@ -1888,6 +1931,7 @@ where
             handles: Arc::clone(&handles),
             max_frames_in_flight,
         })))
+        .with_egfx_core_frame_ack_limit(egfx_core_frame_ack_limit)
         .build();
     server.set_credentials(Some(server::Credentials {
         username: USERNAME.into(),

@@ -1,6 +1,8 @@
 use core::cell::RefCell;
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
+#[cfg(feature = "egfx")]
+use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
@@ -81,6 +83,16 @@ use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::Urbdr
 
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
+
+/// The client's core `maxUnacknowledgedFrameCount` (MS-RDPRFX 2.2.1.3), or
+/// `None` when the client sent no Frame Acknowledge capability or sent zero.
+#[cfg(feature = "egfx")]
+fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZeroU32> {
+    capabilities.iter().find_map(|capability| match capability {
+        CapabilitySet::FrameAcknowledge(capability) => NonZeroU32::new(capability.max_unacknowledged_frame_count),
+        _ => None,
+    })
+}
 
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -1138,6 +1150,10 @@ pub struct RdpServer {
     /// client that came back with a verified one; see
     /// [`Self::set_auto_reconnect_on_request`].
     auto_reconnect_on_request: bool,
+    /// Whether the client's core Frame Acknowledge value caps the EGFX frame
+    /// window; see [`Self::set_egfx_core_frame_ack_limit`].
+    #[cfg(feature = "egfx")]
+    egfx_core_frame_ack_limit: bool,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -1570,6 +1586,10 @@ struct ConnectionState {
     /// Core Data. MS-RDPBCGR 3.3.5.7.1 forbids sending it a Server Set Error
     /// Info PDU unless it did.
     client_supports_errinfo: bool,
+    /// The client's core `maxUnacknowledgedFrameCount` from the last capability
+    /// exchange, kept for EGFX pipelines that a reopen builds later.
+    #[cfg(feature = "egfx")]
+    core_frame_ack_limit: Option<NonZeroU32>,
     /// Auto-detect state, present when the server has auto-detect enabled.
     ///
     /// Probes in flight, RTT samples and the session-lifetime lowest RTT all
@@ -2041,6 +2061,8 @@ impl RdpServer {
             previous_auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
             auto_reconnect_on_request: false,
+            #[cfg(feature = "egfx")]
+            egfx_core_frame_ack_limit: true,
         }
     }
 
@@ -2131,6 +2153,54 @@ impl RdpServer {
     /// effect there.
     pub fn set_auto_reconnect_on_request(&mut self, on_request: bool) {
         self.auto_reconnect_on_request = on_request;
+    }
+
+    /// Choose whether the client's core Frame Acknowledge capability caps the
+    /// EGFX frame window. On by default.
+    ///
+    /// When on, a nonzero `maxUnacknowledgedFrameCount` (MS-RDPRFX 2.2.1.3)
+    /// from the client is applied with
+    /// [`GraphicsPipelineServer::set_client_frame_ack_limit`] on every
+    /// capability exchange (reactivation included) and on each pipeline that
+    /// [`EgfxServerMessage::Reopen`] builds. The EGFX window is then the
+    /// smaller of that value and the pipeline's configured maximum.
+    ///
+    /// When off, the server clears the client ceiling at the same points, so
+    /// the pipeline's own window
+    /// ([`GraphicsPipelineServer::set_max_frames_in_flight`]) applies.
+    /// The core capability is for frames sent as surface commands with frame
+    /// markers and acknowledged with TS_FRAME_ACKNOWLEDGE_PDU (MS-RDPRFX
+    /// 2.2.3.1); EGFX has its own acknowledgement and queue depth
+    /// (RDPGFX_FRAME_ACKNOWLEDGE_PDU, MS-RDPEGFX 2.2.2.13). mstsc advertises 1
+    /// there, so with the cap on it gets one EGFX frame per round trip.
+    ///
+    /// [`GraphicsPipelineServer::set_client_frame_ack_limit`]: ironrdp_egfx::server::GraphicsPipelineServer::set_client_frame_ack_limit
+    /// [`GraphicsPipelineServer::set_max_frames_in_flight`]: ironrdp_egfx::server::GraphicsPipelineServer::set_max_frames_in_flight
+    /// [`EgfxServerMessage::Reopen`]: crate::EgfxServerMessage::Reopen
+    #[cfg(feature = "egfx")]
+    pub fn set_egfx_core_frame_ack_limit(&mut self, enabled: bool) {
+        self.egfx_core_frame_ack_limit = enabled;
+    }
+
+    /// Applies (or, with the option off, clears) the client's core Frame
+    /// Acknowledge ceiling on an EGFX pipeline.
+    #[cfg(feature = "egfx")]
+    fn apply_core_frame_ack_limit(
+        &self,
+        handle: &crate::gfx::GfxServerHandle,
+        core_limit: Option<NonZeroU32>,
+    ) -> ServerResult<()> {
+        let limit = if self.egfx_core_frame_ack_limit {
+            core_limit
+        } else {
+            None
+        };
+        let window = handle
+            .lock()
+            .map_err(|_| ServerError::reason("graphics server", "GfxServerHandle mutex poisoned"))?
+            .set_client_frame_ack_limit(limit);
+        debug!(?limit, window, "EGFX frame window");
+        Ok(())
     }
 
     /// Returns a handle for replacing the cookie while [`Self::run`] owns this
@@ -4079,6 +4149,7 @@ impl RdpServer {
         let create = drdynvc
             .create_registered_channel(processor)
             .map_err_kind("create EGFX channel", ServerErrorKind::Pdu)?;
+        self.apply_core_frame_ack_limit(&handle, conn.core_frame_ack_limit)?;
         self.gfx_handle = Some(handle);
         info!("Opening the EGFX channel again");
         let drdynvc_channel_id = conn
@@ -4833,11 +4904,13 @@ impl RdpServer {
             .await?;
         }
 
-        // The core Frame Acknowledge capability (maxUnacknowledgedFrameCount,
-        // MS-RDPRFX 2.2.1.3) limits frames sent as surface commands with frame
-        // markers. EGFX has its own flow control (MS-RDPEGFX 2.2.2.13 queueDepth),
-        // so the core value is not applied to the EGFX frame window: mstsc
-        // advertises 1 there and shows ~20 fps instead of ~34 with it.
+        #[cfg(feature = "egfx")]
+        {
+            conn.core_frame_ack_limit = client_core_frame_ack_limit(&result.capabilities);
+            if let Some(gfx_handle) = self.gfx_handle.as_ref() {
+                self.apply_core_frame_ack_limit(gfx_handle, conn.core_frame_ack_limit)?;
+            }
+        }
         conn.static_channels = result.static_channels;
         conn.client_supports_heartbeat = result
             .client_early_capability_flags
@@ -6741,6 +6814,68 @@ mod pointer_caps_tests {
             client_pointer_caps(&caps),
             (21, 25, LargePointerSupportFlags::UP_TO_96X96_PIXELS)
         );
+    }
+}
+
+#[cfg(all(test, feature = "egfx"))]
+mod frame_ack_limit_tests {
+    use core::net::Ipv4Addr;
+
+    use super::*;
+    use ironrdp_pdu::rdp::capability_sets::FrameAcknowledge;
+
+    fn core(max_unacknowledged_frame_count: u32) -> Vec<CapabilitySet> {
+        vec![CapabilitySet::FrameAcknowledge(FrameAcknowledge {
+            max_unacknowledged_frame_count,
+        })]
+    }
+
+    #[test]
+    fn absent_and_zero_core_limit_are_unconstrained() {
+        assert_eq!(client_core_frame_ack_limit(&[]), None);
+        assert_eq!(client_core_frame_ack_limit(&core(0)), None);
+    }
+
+    #[test]
+    fn nonzero_core_limit_is_preserved() {
+        assert_eq!(client_core_frame_ack_limit(&core(1)).map(NonZeroU32::get), Some(1));
+    }
+
+    struct Handler;
+
+    impl ironrdp_egfx::server::GraphicsPipelineHandler for Handler {
+        fn capabilities_advertise(&mut self, _pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {}
+
+        fn on_ready(&mut self, _negotiated: &ironrdp_egfx::pdu::CapabilitySet) {}
+    }
+
+    fn window(egfx_core_frame_ack_limit: bool) -> u32 {
+        let mut server = RdpServer::builder()
+            .with_addr((Ipv4Addr::LOCALHOST, 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        server.set_egfx_core_frame_ack_limit(egfx_core_frame_ack_limit);
+        let mut pipeline = ironrdp_egfx::server::GraphicsPipelineServer::new(Box::new(Handler));
+        pipeline.set_max_frames_in_flight(8);
+        let handle = Arc::new(StdMutex::new(pipeline));
+        server
+            .apply_core_frame_ack_limit(&handle, NonZeroU32::new(1))
+            .expect("apply");
+        handle.lock().expect("lock").max_frames_in_flight()
+    }
+
+    /// By default the core value caps the EGFX window (upstream behaviour).
+    #[test]
+    fn core_limit_caps_the_egfx_window_by_default() {
+        assert_eq!(window(true), 1);
+    }
+
+    /// With the option off the pipeline keeps its own window.
+    #[test]
+    fn core_limit_is_ignored_when_the_option_is_off() {
+        assert_eq!(window(false), 8);
     }
 }
 

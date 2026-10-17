@@ -1540,8 +1540,17 @@ impl GraphicsPipelineServer {
 
     /// Replace the current connection's core Frame Acknowledge ceiling.
     ///
-    /// The ceiling survives DVC close/reopen and resize. Apply this for every
-    /// capability exchange, including reactivation; `None` clears the constraint.
+    /// `client_max` is a ceiling on [`Self::set_max_frames_in_flight`]; `None`
+    /// clears it. Returns the effective window. The ceiling survives a DVC
+    /// close and start on this pipeline, and resize; a new pipeline starts
+    /// without one.
+    ///
+    /// The core value (`maxUnacknowledgedFrameCount`, MS-RDPRFX 2.2.1.3) is
+    /// given for surface-command frames; EGFX has its own acknowledgement
+    /// (MS-RDPEGFX 2.2.2.13). A server that applies it to EGFX applies it for
+    /// every capability exchange, including reactivation, and on every new
+    /// pipeline. `ironrdp-server` does this unless
+    /// `RdpServer::set_egfx_core_frame_ack_limit(false)` is set.
     pub fn set_client_frame_ack_limit(&mut self, client_max: Option<NonZeroU32>) -> u32 {
         self.frames.client_max_in_flight = client_max;
         self.frames.max_in_flight()
