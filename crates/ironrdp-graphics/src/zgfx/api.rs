@@ -180,10 +180,7 @@ mod tests {
 
     /// Decompresses a multipart message one segment at a time and checks that no segment
     /// decompresses to more than 65535 bytes. Returns the segment layout and the output.
-    fn decompress_checked(
-        decompressor: &mut super::super::Decompressor,
-        wrapped: &[u8],
-    ) -> (Vec<bool>, Vec<u8>) {
+    fn decompress_checked(decompressor: &mut super::super::Decompressor, wrapped: &[u8]) -> (Vec<bool>, Vec<u8>) {
         let mut layout = Vec::new();
         let mut output = Vec::new();
 
@@ -195,7 +192,10 @@ mod tests {
 
             let before = output.len();
             decompressor.decompress(&single, &mut output).unwrap();
-            assert!(output.len() - before <= ZGFX_SEGMENTED_MAXSIZE, "segment decompresses too large");
+            assert!(
+                output.len() - before <= ZGFX_SEGMENTED_MAXSIZE,
+                "segment decompresses too large"
+            );
             layout.push(compressed);
         }
 
