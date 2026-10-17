@@ -2629,6 +2629,8 @@ async fn connection_info_has_the_client_pointer_capabilities() {
         pdu::rdp::capability_sets::LargePointerSupportFlags::UP_TO_96X96_PIXELS
             | pdu::rdp::capability_sets::LargePointerSupportFlags::UP_TO_384X384_PIXELS
     );
+    // The IronRDP client does not advertise SUPPORT_HEART_BEAT_PDU.
+    assert!(!info.client_supports_heartbeat);
 }
 
 /// Counts how often each `ConnectionHandler` hook reached the handler.
