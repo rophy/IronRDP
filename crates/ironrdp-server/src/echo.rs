@@ -241,4 +241,67 @@ mod tests {
         new.close(9);
         assert!(!handle.is_channel_open());
     }
+
+    /// Drives a real DVC server through the client's PDUs.
+    mod with_dvc_server {
+        use ironrdp_dvc::DrdynvcServer;
+        use ironrdp_dvc::pdu::{
+            CapabilitiesResponsePdu, CapsVersion, ClosePdu, CreateResponsePdu, CreationStatus, DrdynvcClientPdu,
+        };
+        use ironrdp_svc::SvcProcessor as _;
+
+        use super::*;
+
+        fn client_sends(server: &mut DrdynvcServer, pdu: DrdynvcClientPdu) {
+            server.process(&ironrdp_core::encode_vec(&pdu).unwrap()).unwrap();
+        }
+
+        /// A DVC server with the ECHO bridge; the client has sent its caps.
+        fn server(handle: &EchoServerHandle) -> (DrdynvcServer, u32) {
+            let mut server = DrdynvcServer::new().with_dynamic_channel(EchoDvcBridge::new(handle.clone()));
+            client_sends(
+                &mut server,
+                DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(CapsVersion::V2)),
+            );
+            let id = server.get_channel_id_by_type::<EchoDvcBridge>().unwrap();
+            (server, id)
+        }
+
+        #[test]
+        fn open_after_create_ok_until_the_client_closes() {
+            let handle = handle();
+            let (mut server, id) = server(&handle);
+            assert!(!handle.is_channel_open(), "Create Request sent, no response yet");
+            client_sends(
+                &mut server,
+                DrdynvcClientPdu::Create(CreateResponsePdu::new(id, CreationStatus::OK)),
+            );
+            assert!(handle.is_channel_open());
+            client_sends(&mut server, DrdynvcClientPdu::Close(ClosePdu::new(id)));
+            assert!(!handle.is_channel_open());
+        }
+
+        #[test]
+        fn declined_by_the_client_is_not_open() {
+            let handle = handle();
+            let (mut server, id) = server(&handle);
+            client_sends(
+                &mut server,
+                DrdynvcClientPdu::Create(CreateResponsePdu::new(id, CreationStatus::NO_LISTENER)),
+            );
+            assert!(!handle.is_channel_open());
+        }
+
+        #[test]
+        fn not_open_after_the_connection_ends() {
+            let handle = handle();
+            let (mut server, id) = server(&handle);
+            client_sends(
+                &mut server,
+                DrdynvcClientPdu::Create(CreateResponsePdu::new(id, CreationStatus::OK)),
+            );
+            drop(server);
+            assert!(!handle.is_channel_open());
+        }
+    }
 }
