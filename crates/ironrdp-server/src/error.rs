@@ -50,6 +50,19 @@ pub enum ServerErrorKind {
     Custom,
 }
 
+impl ServerErrorKind {
+    /// Whether the failure comes from the client or the network, not from the
+    /// server: a refused logon or a dropped handshake ([`Self::Connector`]), a
+    /// reset or closed socket ([`Self::Io`]), or a PDU the client sent that
+    /// does not decode ([`Self::Decode`]).
+    ///
+    /// The server logs such a connection error at debug level, and other
+    /// errors at error level.
+    pub fn is_client_side(&self) -> bool {
+        matches!(self, Self::Connector(_) | Self::Io(_) | Self::Decode(_))
+    }
+}
+
 impl fmt::Display for ServerErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -168,5 +181,46 @@ impl<T> ServerResultExt for ServerResult<T> {
             e.set_context(context);
             e
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_and_network_failures_are_client_side() {
+        let client_side = [
+            ServerError::io("read pdu", io::Error::from(io::ErrorKind::ConnectionReset)),
+            ServerError::decode(ironrdp_core::other_err::<DecodeError>("ctx", "bad")),
+            ServerError::new(
+                "accept_begin failed",
+                ServerErrorKind::Connector(<ConnectorError as ironrdp_connector::ConnectorErrorExt>::general("ctx")),
+            ),
+        ];
+        for e in client_side {
+            assert!(e.kind().is_client_side(), "{e}");
+        }
+    }
+
+    #[test]
+    fn server_failures_are_not_client_side() {
+        let server_side = [
+            ServerError::encode(ironrdp_core::other_err::<EncodeError>("ctx", "bad")),
+            ServerError::new(
+                "svc process",
+                ServerErrorKind::Pdu(<PduError as ironrdp_pdu::PduErrorExt>::encode(
+                    "ctx",
+                    ironrdp_core::other_err::<EncodeError>("ctx", "bad"),
+                )),
+            ),
+            ServerError::channel("display channel"),
+            ServerError::unsupported("feature"),
+            ServerError::reason("ctx", "reason"),
+            ServerError::custom("ctx", io::Error::other("source")),
+        ];
+        for e in server_side {
+            assert!(!e.kind().is_client_side(), "{e}");
+        }
     }
 }

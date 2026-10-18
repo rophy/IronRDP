@@ -257,9 +257,9 @@ pub trait ConnectionHandler: Send {
     /// Called after `run_connection()` completes (successfully or with error).
     ///
     /// `duration` is the wall-clock time the connection was active.
-    /// `error` is `Some` if the connection ended with an error. With a
-    /// connection handler the server logs that error at debug level only: the
-    /// handler reports it.
+    /// `error` is `Some` if the connection ended with an error. The server
+    /// logs a client-side error (see [`ServerErrorKind::is_client_side`]) at
+    /// debug level and other errors at error level.
     fn on_disconnected(
         &mut self,
         peer: SocketAddr,
@@ -3409,10 +3409,9 @@ impl RdpServer {
             }
 
             if let Err(ref error) = result {
-                // A connection handler gets the error in `on_disconnected` and
-                // reports it (most are client-side: a refused logon, a dropped
-                // handshake); without one the server logs it as an error.
-                if self.connection_handler.is_some() {
+                // A client-side end (refused logon, dropped handshake, peer
+                // reset) is routine; only a server fault is an error.
+                if error.kind().is_client_side() {
                     debug!(?error, "Connection error");
                 } else {
                     error!(?error, "Connection error");
