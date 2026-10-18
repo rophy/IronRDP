@@ -5998,7 +5998,7 @@ impl OutboundQueue {
                     warn!(
                         bytes = len,
                         write_ms,
-                        "client write stalled, possible TCP back-pressure (more stalls of this connection at debug level)"
+                        "client write stalled, possible TCP back-pressure (more stalls of this session loop at debug level)"
                     );
                 } else {
                     debug!(bytes = len, write_ms, stalls, "client write stalled");

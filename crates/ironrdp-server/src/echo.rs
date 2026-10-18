@@ -185,8 +185,8 @@ impl DvcProcessor for EchoDvcBridge {
 }
 
 impl Drop for EchoDvcBridge {
-    // The DVC server drops the processor when the client closes the channel
-    // and when the connection ends, without a call to `close`.
+    // The DVC server calls `close` before it drops an opened channel. This is
+    // a guard for the other paths (a declined or pending channel).
     fn drop(&mut self) {
         self.handle.set_open(self.id, false);
     }
