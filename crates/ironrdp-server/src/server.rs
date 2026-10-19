@@ -170,6 +170,15 @@ pub struct ConnectionInfo {
     /// channel, so heartbeats ([`RdpServer::enable_heartbeat`],
     /// [`RdpServer::heartbeat_handle`]) reach it.
     pub client_supports_heartbeat: bool,
+    /// The remote address of this connection: the peer that
+    /// [`RdpServer::run`] accepted (the same address that
+    /// [`ConnectionHandler::on_accept`] and [`ConnectionHandler::on_disconnected`]
+    /// get for it). With [`ConnectionPolicy::Preempt`], `on_accept` also runs
+    /// for candidates while this connection is live, so the last `on_accept`
+    /// peer is not always this one. `None` for [`RdpServer::run_connection`]
+    /// and [`RdpServer::run_connection_with`] (the server does not see the
+    /// peer of a stream it is given).
+    pub peer_addr: Option<SocketAddr>,
 }
 
 impl ConnectionInfo {
@@ -188,7 +197,15 @@ impl ConnectionInfo {
             color_pointer_cache_size: 0,
             large_pointer_flags: LargePointerSupportFlags::empty(),
             client_supports_heartbeat: false,
+            peer_addr: None,
         }
+    }
+
+    /// Sets the peer address, for tests of downstream handlers.
+    #[must_use]
+    pub fn with_peer_addr(mut self, peer_addr: Option<SocketAddr>) -> Self {
+        self.peer_addr = peer_addr;
+        self
     }
 
     /// Sets the pointer capabilities, for tests of downstream handlers.
@@ -1054,6 +1071,9 @@ pub struct RdpServer {
     /// The local address the current client reached. See
     /// [`Self::set_connection_local_addr`].
     connection_local_addr: Option<SocketAddr>,
+    /// The remote address of the connection `run` serves now
+    /// ([`ConnectionInfo::peer_addr`]); `None` outside `run`.
+    connection_peer_addr: Option<SocketAddr>,
     /// Whether each connection runs auto-detect; see [`Self::enable_autodetect`].
     autodetect_enabled: bool,
     heartbeat: Option<HeartbeatConfig>,
@@ -2038,6 +2058,7 @@ impl RdpServer {
             pending_authenticated_credentials: Arc::new(StdMutex::new(None)),
             local_addr: None,
             connection_local_addr: None,
+            connection_peer_addr: None,
             autodetect_enabled: false,
             heartbeat: None,
             heartbeat_requests: HeartbeatHandle::default(),
@@ -3175,6 +3196,7 @@ impl RdpServer {
                 continue;
             }
             self.clear_bound_connection();
+            self.connection_peer_addr = Some(peer);
 
             let started = tokio::time::Instant::now();
 
@@ -3421,6 +3443,7 @@ impl RdpServer {
             // Neither path above goes through `run_connection_with`, which
             // clears this for embedders.
             self.connection_local_addr = None;
+            self.connection_peer_addr = None;
 
             if let Some(action) = with_connection_handler(self.connection_handler.as_ref(), |h| {
                 h.on_disconnected(peer, duration, result.as_ref().err())
@@ -4977,6 +5000,7 @@ impl RdpServer {
                         && result
                             .client_early_capability_flags
                             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_HEART_BEAT_PDU),
+                    peer_addr: self.connection_peer_addr,
                 });
             });
         }

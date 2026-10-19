@@ -3006,6 +3006,8 @@ async fn connection_info_has_the_client_pointer_capabilities() {
     }));
     let ev = server.event_sender().clone();
     let recorded = Arc::clone(&info);
+    let client_addr = Arc::new(StdMutex::new(None));
+    let client_addr_slot = Arc::clone(&client_addr);
 
     let local = tokio::task::LocalSet::new();
     local
@@ -3015,6 +3017,7 @@ async fn connection_info_has_the_client_pointer_capabilities() {
             });
             let server_addr = local_addr_of(&ev).await;
             let (client, _) = connect_client(server_addr, |client_addr| {
+                *client_addr_slot.lock().unwrap() = Some(client_addr);
                 connector::ClientConnector::new(default_client_config(), client_addr)
             })
             .await;
@@ -3028,6 +3031,9 @@ async fn connection_info_has_the_client_pointer_capabilities() {
         .await;
 
     let info = info.lock().unwrap().clone().expect("on_connection_info was called");
+    // `run` accepted the client, so it knows the client's address.
+    assert_eq!(info.peer_addr, *client_addr.lock().unwrap());
+    assert!(info.peer_addr.is_some());
     // The IronRDP client advertises 32 slots for both caches, and both large pointer sizes.
     assert_eq!(info.pointer_cache_size, 32);
     assert_eq!(info.color_pointer_cache_size, 32);
@@ -3304,6 +3310,10 @@ struct HookCounts {
     accept: AtomicUsize,
     info: AtomicUsize,
     disconnected: AtomicUsize,
+    /// The peer of each `on_accept` and `ConnectionInfo::peer_addr` of each
+    /// `on_connection_info`, in call order.
+    accept_peers: StdMutex<Vec<SocketAddr>>,
+    info_peers: StdMutex<Vec<Option<SocketAddr>>>,
 }
 
 impl HookCounts {
@@ -3328,12 +3338,14 @@ impl HookCounts {
 struct HookRecorder(Arc<HookCounts>);
 
 impl server::ConnectionHandler for HookRecorder {
-    fn on_accept(&mut self, _peer: SocketAddr) -> bool {
+    fn on_accept(&mut self, peer: SocketAddr) -> bool {
+        self.0.accept_peers.lock().unwrap().push(peer);
         self.0.accept.fetch_add(1, Ordering::SeqCst);
         true
     }
 
-    fn on_connection_info(&mut self, _info: &server::ConnectionInfo) {
+    fn on_connection_info(&mut self, info: &server::ConnectionInfo) {
+        self.0.info_peers.lock().unwrap().push(info.peer_addr);
         self.0.info.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -3473,6 +3485,10 @@ async fn connection_handler_sees_every_hook_across_a_preemption() {
             (2, 2, 1),
             "after the takeover: both accepted, both reported connection info, the evicted one disconnected"
         );
+        // Each session's connection info names its own peer.
+        let accepted: Vec<_> = counts.accept_peers.lock().unwrap().iter().copied().map(Some).collect();
+        assert_eq!(*counts.info_peers.lock().unwrap(), accepted);
+        assert_ne!(accepted[0], accepted[1]);
 
         // And the evicted client's transport is closed, not left open.
         let evicted = tokio::time::timeout(Duration::from_secs(5), async {
