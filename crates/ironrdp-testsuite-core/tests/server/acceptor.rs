@@ -1733,7 +1733,7 @@ async fn accept_finalize_sends_the_error_info_for_other_credentials() {
         .err()
         .expect("other credentials should fail the handshake");
     assert!(
-        matches!(error.kind(), ConnectorErrorKind::General),
+        matches!(error.kind(), ConnectorErrorKind::AccessDenied),
         "expected the credentials rejection, got {error}"
     );
 
@@ -1772,7 +1772,7 @@ async fn accept_finalize_sends_no_error_info_to_a_client_without_support(
         .err()
         .expect("other credentials should fail the handshake");
     assert!(
-        matches!(error.kind(), ConnectorErrorKind::General),
+        matches!(error.kind(), ConnectorErrorKind::AccessDenied),
         "expected the credentials rejection, got {error}"
     );
 
@@ -1858,7 +1858,7 @@ async fn accept_begin_reports_the_step_error_when_sending_its_pdu_fails() {
         .err()
         .expect("a security protocol mismatch should fail the handshake");
     assert!(
-        matches!(error.kind(), ConnectorErrorKind::Reason(_)),
+        matches!(error.kind(), ConnectorErrorKind::Negotiation(_)),
         "expected the security protocol mismatch, got {error}"
     );
 }

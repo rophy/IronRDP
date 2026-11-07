@@ -197,6 +197,9 @@ impl<'a> CredsspSequence<'a> {
         match &self.state {
             CredsspState::Ongoing => Ok(Some(&CREDSSP_TS_REQUEST_HINT)),
             CredsspState::Finished(_) => Ok(None),
+            CredsspState::ServerError(err) if err.error_type == sspi::ErrorKind::LogonDenied => Err(
+                ConnectorError::new("Credssp server error", ConnectorErrorKind::AccessDenied).with_source(err.clone()),
+            ),
             CredsspState::ServerError(err) => Err(custom_err!("Credssp server error", err.clone())),
         }
     }

@@ -3,8 +3,8 @@ use core::mem;
 
 use ironrdp_connector::sspi::{AuthIdentity, UsernameParts};
 use ironrdp_connector::{
-    ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize, MonotonicInstant, Sequence, State, Written,
-    encode_x224_packet, general_err, reason_err,
+    ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, MonotonicInstant,
+    NegotiationFailure, Sequence, State, Written, encode_x224_packet, general_err, reason_err,
 };
 use ironrdp_core::{ReadCursor, WriteBuf, decode, decode_cursor};
 use ironrdp_pdu as pdu;
@@ -1236,11 +1236,15 @@ impl Sequence for Acceptor {
 
                     ironrdp_core::encode_buf(&X224(failure), output).map_err(ConnectorError::encode)?;
 
-                    return Err(reason_err!(
+                    debug!(
+                        required = ?self.security,
+                        offered = ?requested_protocol,
+                        "Security protocol mismatch"
+                    );
+
+                    return Err(ConnectorError::new(
                         "security protocol mismatch",
-                        "server requires {:?} but client only offered {:?}",
-                        self.security,
-                        requested_protocol,
+                        ConnectorErrorKind::Negotiation(NegotiationFailure::from(failure_code)),
                     ));
                 };
                 let connection_confirm = nego::ConnectionConfirm::Response {
@@ -1538,7 +1542,10 @@ impl Sequence for Acceptor {
                         && !credentials_match(expected, &creds)
                     {
                         self.encode_access_denied(output)?;
-                        return Err(ConnectorError::general("invalid credentials"));
+                        return Err(ConnectorError::new(
+                            "invalid credentials",
+                            ConnectorErrorKind::AccessDenied,
+                        ));
                     }
 
                     // Store credentials for later retrieval via AcceptorResult.

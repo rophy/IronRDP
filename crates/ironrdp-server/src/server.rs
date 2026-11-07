@@ -3811,7 +3811,11 @@ impl RdpServer {
             pending = successor;
 
             if let Err(ref error) = result {
-                error!(?error, "Connection error");
+                if ends_by_client(error) {
+                    info!(?error, "Connection ended by the client");
+                } else {
+                    error!(?error, "Connection error");
+                }
             }
 
             if let Some(action) = peer.and_then(|peer| {
@@ -6735,6 +6739,39 @@ fn autodetect_response_from_sub_header(
             None
         }
     }
+}
+
+/// Whether a connection ended because of the client, not because of a server
+/// fault: the client closed or reset the connection, its logon was refused,
+/// or it offered no security protocol that the server accepts.
+fn ends_by_client(error: &ServerError) -> bool {
+    use std::io::ErrorKind;
+
+    let mut cause: Option<&(dyn core::error::Error + 'static)> = Some(error);
+    while let Some(e) = cause {
+        if let Some(e) = e.downcast_ref::<ConnectorError>()
+            && matches!(
+                e.kind(),
+                ironrdp_connector::ConnectorErrorKind::AccessDenied
+                    | ironrdp_connector::ConnectorErrorKind::Negotiation(_)
+            )
+        {
+            return true;
+        }
+        if let Some(e) = e.downcast_ref::<std::io::Error>()
+            && matches!(
+                e.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+            )
+        {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
 }
 
 /// Encode a server-initiated Heartbeat PDU for the MCS message channel.
